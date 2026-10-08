@@ -231,8 +231,8 @@ Plain text, made for a grader skimming for rubric items:
 - Commit as each unit of work completes: a docs commit, a scaffold commit, then
   one commit per implementation task, test included in the same commit.
 - Conventional-commit style subjects: `feat:`, `test:`, `docs:`, `build:`, `fix:`, `refactor:`.
-- Never push. Never add `Co-Authored-By` trailers or any mention of Claude,
-  Anthropic or AI assistance anywhere in the repository.
+- Never push. Never add `Co-Authored-By` trailers or any tool or assistant
+  attribution anywhere in the repository.
 - Binaries, objects, `output.txt`, core dumps and `dist/` are never committed.
   Project 1's history already contains two binaries; the rewrite removes them.
 
