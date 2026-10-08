@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds every unit test binary, runs it, then runs every e2e script. One PASS/FAIL line per test.
-# Invoked by `make test`, which exports CC, CFLAGS and CLIENT_BIN; the defaults below match the Makefile.
+# Invoked by `make test`, which exports CC, CFLAGS, CLIENT_BIN and SERVER_BIN; the defaults below match the Makefile.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -8,6 +8,7 @@ BUILD="$ROOT/build"
 CC="${CC:-gcc}"
 CFLAGS="${CFLAGS:--O2 -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wconversion -Wvla -Werror}"
 export CLIENT_BIN="${CLIENT_BIN:-$BUILD/client}"
+export SERVER_BIN="${SERVER_BIN:-$BUILD/mathbot_server}"
 export MOCK_SERVER="$ROOT/test/e2e/mock_server.py"
 
 mkdir -p "$BUILD/test"
