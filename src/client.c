@@ -22,12 +22,15 @@ enum {
     MIN_PORT = 1,
     MAX_PORT = 65535,
     MAX_IDENTIFICATION_LENGTH = 254,
-    MESSAGE_CAPACITY = 512
+    MESSAGE_CAPACITY = 512,
+    FLAG_CAPACITY = 256
 };
 
 #define IDENTIFICATION_DOMAIN "@umass.edu"
 #define PROTOCOL_PREFIX "cs230 "
 #define HELLO_PREFIX "cs230 HELLO "
+#define STATUS_PREFIX "cs230 STATUS "
+#define BYE_SUFFIX " BYE"
 #define VERBOSE_VARIABLE "MATHBOT_VERBOSE"
 
 typedef struct {
@@ -42,11 +45,24 @@ typedef struct {
     size_t used;
 } LineBuffer;
 
+/* One arithmetic problem from a STATUS line: left <operation> right. */
+typedef struct {
+    long long left;
+    char operation;
+    long long right;
+} MathProblem;
+
 typedef enum {
     RECEIVE_LINE,
     RECEIVE_EOF,
     RECEIVE_ERROR
 } ReceiveResult;
+
+enum {
+    SESSION_CONTINUE,
+    SESSION_DONE,
+    SESSION_FAILED
+};
 
 /* Prints the command-line usage on stderr. */
 static void print_usage(const char *program) {
@@ -246,20 +262,189 @@ static int connect_to_server(const char *host, unsigned short port) {
     return socket_fd;
 }
 
+/* Parses a long long starting exactly at text (no leading whitespace or '+',
+ * which strtoll would accept); end receives the first unparsed character. */
+static bool parse_operand(const char *text, const char **end, long long *value) {
+    char *parse_end;
+    if (text[0] != '-' && !isdigit((unsigned char)text[0])) {
+        return false;
+    }
+    errno = 0;
+    *value = strtoll(text, &parse_end, 10);
+    if (errno == ERANGE || parse_end == text) {
+        return false;
+    }
+    *end = parse_end;
+    return true;
+}
+
+/* True for the four operators math speak uses. */
+static bool is_operator(char candidate) {
+    return candidate == '+' || candidate == '-' || candidate == '*' || candidate == '/';
+}
+
+/* Parses "cs230 STATUS <num> <op> <num>" with single spaces and nothing else. */
+static bool parse_status(const char *line, MathProblem *problem) {
+    const char *cursor;
+    if (strncmp(line, STATUS_PREFIX, strlen(STATUS_PREFIX)) != 0) {
+        return false;
+    }
+    cursor = line + strlen(STATUS_PREFIX);
+    if (!parse_operand(cursor, &cursor, &problem->left)) {
+        return false;
+    }
+    if (cursor[0] != ' ' || !is_operator(cursor[1]) || cursor[2] != ' ') {
+        return false;
+    }
+    problem->operation = cursor[1];
+    cursor += 3;
+    if (!parse_operand(cursor, &cursor, &problem->right)) {
+        return false;
+    }
+    return *cursor == '\0';
+}
+
+/* Parses "cs230 <flag> BYE" into flag; the flag is one non-empty token without spaces. */
+static bool parse_bye(const char *line, char *flag, size_t capacity) {
+    size_t prefix_length = strlen(PROTOCOL_PREFIX);
+    size_t suffix_length = strlen(BYE_SUFFIX);
+    size_t length = strlen(line);
+    size_t flag_length;
+    if (length < prefix_length + 1 + suffix_length) {
+        return false;
+    }
+    if (strncmp(line, PROTOCOL_PREFIX, prefix_length) != 0 ||
+        strcmp(line + length - suffix_length, BYE_SUFFIX) != 0) {
+        return false;
+    }
+    flag_length = length - prefix_length - suffix_length;
+    if (flag_length >= capacity || memchr(line + prefix_length, ' ', flag_length) != NULL) {
+        return false;
+    }
+    memcpy(flag, line + prefix_length, flag_length);
+    flag[flag_length] = '\0';
+    return true;
+}
+
+/* left + right without overflow; false when the sum does not fit. */
+static bool add_checked(long long left, long long right, long long *result) {
+    if ((right > 0 && left > LLONG_MAX - right) || (right < 0 && left < LLONG_MIN - right)) {
+        return false;
+    }
+    *result = left + right;
+    return true;
+}
+
+/* left - right without overflow; false when the difference does not fit. */
+static bool subtract_checked(long long left, long long right, long long *result) {
+    if ((right < 0 && left > LLONG_MAX + right) || (right > 0 && left < LLONG_MIN + right)) {
+        return false;
+    }
+    *result = left - right;
+    return true;
+}
+
+/* True when left * right fits, by sign case (CERT INT32-C adapted to long long). */
+static bool multiplication_fits(long long left, long long right) {
+    if (left > 0) {
+        return right > 0 ? left <= LLONG_MAX / right : right >= LLONG_MIN / left;
+    }
+    if (right > 0) {
+        return left >= LLONG_MIN / right;
+    }
+    return left == 0 || right >= LLONG_MAX / left;
+}
+
+/* left * right without overflow; false when the product does not fit. */
+static bool multiply_checked(long long left, long long right, long long *result) {
+    if (!multiplication_fits(left, right)) {
+        return false;
+    }
+    *result = left * right;
+    return true;
+}
+
+/* left / right truncated toward zero (C99 6.5.5); false for the two undefined cases. */
+static bool divide_checked(long long left, long long right, long long *result) {
+    if (right == 0 || (left == LLONG_MIN && right == -1)) {
+        return false;
+    }
+    *result = left / right;
+    return true;
+}
+
+/* Computes the problem; false on division by zero, overflow or an unknown operator. */
+static bool evaluate(const MathProblem *problem, long long *result) {
+    switch (problem->operation) {
+    case '+':
+        return add_checked(problem->left, problem->right, result);
+    case '-':
+        return subtract_checked(problem->left, problem->right, result);
+    case '*':
+        return multiply_checked(problem->left, problem->right, result);
+    case '/':
+        return divide_checked(problem->left, problem->right, result);
+    default:
+        return false;
+    }
+}
+
 /* Reports the server closing the connection before the flag arrived. */
 static void report_early_disconnect(void) {
     fprintf(stderr, "server closed the connection before sending the flag "
                     "(wrong answer or protocol error)\n");
 }
 
+/* Solves one STATUS problem and sends "cs230 <answer>\n". */
+static bool handle_status(int socket_fd, const MathProblem *problem, bool verbose) {
+    long long answer;
+    char message[MESSAGE_CAPACITY];
+    int written;
+    if (!evaluate(problem, &answer)) {
+        fprintf(stderr, "protocol error: cannot evaluate %lld %c %lld\n",
+                problem->left, problem->operation, problem->right);
+        return false;
+    }
+    written = snprintf(message, sizeof message, "%s%lld\n", PROTOCOL_PREFIX, answer);
+    if (written < 0 || (size_t)written >= sizeof message) {
+        fprintf(stderr, "answer too long to send\n");
+        return false;
+    }
+    return send_line(socket_fd, message, verbose);
+}
+
+/* Writes the captured flag on stdout, the only thing the client ever prints there. */
+static bool print_flag(const char *flag) {
+    if (printf("%s\n", flag) < 0 || fflush(stdout) != 0) {
+        fprintf(stderr, "stdout: %s\n", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Answers a STATUS line, prints the flag of a BYE line, or reports anything else. */
+static int handle_line(int socket_fd, const char *line, bool verbose) {
+    MathProblem problem;
+    char flag[FLAG_CAPACITY];
+    if (parse_status(line, &problem)) {
+        return handle_status(socket_fd, &problem, verbose) ? SESSION_CONTINUE : SESSION_FAILED;
+    }
+    if (parse_bye(line, flag, sizeof flag)) {
+        return print_flag(flag) ? SESSION_DONE : SESSION_FAILED;
+    }
+    fprintf(stderr, "protocol error: unexpected message '%s'\n", line);
+    return SESSION_FAILED;
+}
+
 /* Identifies to the server and processes its lines until BYE; returns the exit status. */
 static int run_session(int socket_fd, const char *identification, bool verbose) {
     LineBuffer buffer = { {0}, 0 };
     char line[RECEIVE_BUFFER_SIZE];
+    int outcome = SESSION_CONTINUE;
     if (!send_hello(socket_fd, identification, verbose)) {
         return EXIT_FAILURE;
     }
-    for (;;) {
+    while (outcome == SESSION_CONTINUE) {
         ReceiveResult result = receive_line(socket_fd, &buffer, line, sizeof line);
         if (result == RECEIVE_EOF) {
             report_early_disconnect();
@@ -271,9 +456,9 @@ static int run_session(int socket_fd, const char *identification, bool verbose) 
         if (verbose) {
             fprintf(stderr, "<< %s\n", line);
         }
-        fprintf(stderr, "protocol error: unexpected message '%s'\n", line);
-        return EXIT_FAILURE;
+        outcome = handle_line(socket_fd, line, verbose);
     }
+    return outcome == SESSION_DONE ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 /* True when MATHBOT_VERBOSE is set to anything other than empty or "0". */

@@ -210,6 +210,181 @@ static void test_verbose_flag(void) {
     CHECK(!is_verbose_enabled());
 }
 
+static void test_parse_status_accepts_spec_example(void) {
+    MathProblem problem;
+    CHECK(parse_status("cs230 STATUS 505 * 700", &problem));
+    CHECK_EQ_INT(problem.left, 505);
+    CHECK_EQ_INT(problem.operation, '*');
+    CHECK_EQ_INT(problem.right, 700);
+}
+
+static void test_parse_status_accepts_negatives(void) {
+    MathProblem problem;
+    CHECK(parse_status("cs230 STATUS -12 / -5", &problem));
+    CHECK_EQ_INT(problem.left, -12);
+    CHECK_EQ_INT(problem.operation, '/');
+    CHECK_EQ_INT(problem.right, -5);
+    CHECK(parse_status("cs230 STATUS 0 - 0", &problem));
+    CHECK_EQ_INT(problem.left, 0);
+    CHECK_EQ_INT(problem.right, 0);
+}
+
+static void test_parse_status_rejects_malformed(void) {
+    MathProblem problem;
+    CHECK(!parse_status("cs230 STATUS 1  + 2", &problem));
+    CHECK(!parse_status("cs230 STATUS  1 + 2", &problem));
+    CHECK(!parse_status("cs230 STATUS 1 + 2 ", &problem));
+    CHECK(!parse_status("cs230 STATUS 1 + 2 3", &problem));
+    CHECK(!parse_status("cs230 STATUS 1 % 2", &problem));
+    CHECK(!parse_status("cs230 STATUS 1 +", &problem));
+    CHECK(!parse_status("cs230 STATUS 1 + ", &problem));
+    CHECK(!parse_status("cs230 STATUS a + 2", &problem));
+    CHECK(!parse_status("cs230 STATUS +1 + 2", &problem));
+    CHECK(!parse_status("cs230 STATUS - + 2", &problem));
+    CHECK(!parse_status("cs230 STATUS 1 + 2\r", &problem));
+    CHECK(!parse_status("cs230 STATUS 99999999999999999999 + 2", &problem));
+    CHECK(!parse_status("cs230 STATUS 1 + -9999999999999999999", &problem));
+    CHECK(!parse_status("cs230 HELLO 1 + 2", &problem));
+    CHECK(!parse_status("cs230 STATUS", &problem));
+    CHECK(!parse_status("", &problem));
+}
+
+static void test_parse_bye(void) {
+    char flag[FLAG_CAPACITY];
+    CHECK(parse_bye("cs230 7c5ee45183d657f5148fd4bbabb6615128ec32699164980be7b8b451fd9ac0c3 BYE", flag, sizeof flag));
+    CHECK_EQ_STR(flag, "7c5ee45183d657f5148fd4bbabb6615128ec32699164980be7b8b451fd9ac0c3");
+    CHECK(parse_bye("cs230 x BYE", flag, sizeof flag));
+    CHECK_EQ_STR(flag, "x");
+    CHECK(!parse_bye("cs230  BYE", flag, sizeof flag));
+    CHECK(!parse_bye("cs230 BYE", flag, sizeof flag));
+    CHECK(!parse_bye("cs230 abc def BYE", flag, sizeof flag));
+    CHECK(!parse_bye("cs230 abc BYE ", flag, sizeof flag));
+    CHECK(!parse_bye("cs230 abc BYE\r", flag, sizeof flag));
+    CHECK(!parse_bye("cs230 STATUS 1 + 2", flag, sizeof flag));
+    CHECK(!parse_bye("cs230 abc", flag, sizeof flag));
+    CHECK(!parse_bye("", flag, sizeof flag));
+    CHECK(!parse_bye("cs230 abcdef BYE", flag, 4));
+}
+
+static void test_evaluate_basic(void) {
+    long long result;
+    MathProblem add = { 505, '+', 700 };
+    MathProblem sub = { 5, '-', 9 };
+    MathProblem mul = { 505, '*', 700 };
+    MathProblem div = { 200, '/', 3 };
+    CHECK(evaluate(&add, &result) && result == 1205);
+    CHECK(evaluate(&sub, &result) && result == -4);
+    CHECK(evaluate(&mul, &result) && result == 353500);
+    CHECK(evaluate(&div, &result) && result == 66);
+}
+
+static void test_evaluate_division_truncates_toward_zero(void) {
+    long long result;
+    MathProblem a = { -7, '/', 2 };
+    MathProblem b = { 7, '/', -2 };
+    MathProblem c = { -7, '/', -2 };
+    MathProblem d = { 1, '/', 3 };
+    MathProblem e = { -200, '/', 3 };
+    CHECK(evaluate(&a, &result) && result == -3);
+    CHECK(evaluate(&b, &result) && result == -3);
+    CHECK(evaluate(&c, &result) && result == 3);
+    CHECK(evaluate(&d, &result) && result == 0);
+    CHECK(evaluate(&e, &result) && result == -66);
+}
+
+static void test_evaluate_division_by_zero_refused(void) {
+    long long result;
+    MathProblem zero = { 5, '/', 0 };
+    MathProblem min = { LLONG_MIN, '/', -1 };
+    MathProblem min_ok = { LLONG_MIN, '/', 1 };
+    CHECK(!evaluate(&zero, &result));
+    CHECK(!evaluate(&min, &result));
+    CHECK(evaluate(&min_ok, &result) && result == LLONG_MIN);
+}
+
+static void test_evaluate_overflow_refused(void) {
+    long long result;
+    MathProblem add = { LLONG_MAX, '+', 1 };
+    MathProblem add_neg = { LLONG_MIN, '+', -1 };
+    MathProblem add_ok = { LLONG_MAX, '+', -1 };
+    MathProblem sub = { LLONG_MIN, '-', 1 };
+    MathProblem sub_neg = { LLONG_MAX, '-', -1 };
+    MathProblem sub_ok = { LLONG_MIN, '-', -1 };
+    MathProblem mul = { LLONG_MAX, '*', 2 };
+    MathProblem mul_neg = { LLONG_MIN, '*', -1 };
+    MathProblem mul_mixed = { -3037000500LL, '*', 3037000500LL };
+    MathProblem mul_both_neg = { -3037000500LL, '*', -3037000500LL };
+    MathProblem mul_ok = { -3037000499LL, '*', 3037000499LL };
+    MathProblem mul_zero = { LLONG_MIN, '*', 0 };
+    MathProblem unknown = { 1, '%', 1 };
+    CHECK(!evaluate(&add, &result));
+    CHECK(!evaluate(&add_neg, &result));
+    CHECK(evaluate(&add_ok, &result) && result == LLONG_MAX - 1);
+    CHECK(!evaluate(&sub, &result));
+    CHECK(!evaluate(&sub_neg, &result));
+    CHECK(evaluate(&sub_ok, &result) && result == LLONG_MIN + 1);
+    CHECK(!evaluate(&mul, &result));
+    CHECK(!evaluate(&mul_neg, &result));
+    CHECK(!evaluate(&mul_mixed, &result));
+    CHECK(!evaluate(&mul_both_neg, &result));
+    CHECK(evaluate(&mul_ok, &result) && result == -9223372030926249001LL);
+    CHECK(evaluate(&mul_zero, &result) && result == 0);
+    CHECK(!evaluate(&unknown, &result));
+}
+
+static void test_handle_status_exact_bytes(void) {
+    int fds[2];
+    char received[64];
+    MathProblem problem = { 505, '*', 700 };
+    MathProblem negative = { -200, '/', 3 };
+    MathProblem bad = { 1, '/', 0 };
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(handle_status(fds[0], &problem, false));
+    read_all_available(fds[1], received, sizeof received);
+    CHECK_EQ_STR(received, "cs230 353500\n");
+    CHECK(handle_status(fds[0], &negative, false));
+    read_all_available(fds[1], received, sizeof received);
+    CHECK_EQ_STR(received, "cs230 -66\n");
+    CHECK(!handle_status(fds[0], &bad, false));
+    CHECK(close(fds[0]) == 0);
+    CHECK(close(fds[1]) == 0);
+}
+
+/* Runs run_session against a scripted peer that writes script then closes; returns the status. */
+static int run_scripted_session(const char *script, char *received, size_t capacity) {
+    int fds[2];
+    int status;
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(write(fds[1], script, strlen(script)) == (ssize_t)strlen(script));
+    CHECK(shutdown(fds[1], SHUT_WR) == 0);
+    status = run_session(fds[0], "jdoe@umass.edu", false);
+    read_all_available(fds[1], received, capacity);
+    CHECK(close(fds[0]) == 0);
+    CHECK(close(fds[1]) == 0);
+    return status;
+}
+
+static void test_run_session_answers_then_prints_flag(void) {
+    char received[256];
+    CHECK_EQ_INT(run_scripted_session("cs230 STATUS 505 * 700\ncs230 STATUS 200 / 3\ncs230 abc123 BYE\n",
+                                      received, sizeof received), EXIT_SUCCESS);
+    CHECK_EQ_STR(received, "cs230 HELLO jdoe@umass.edu\ncs230 353500\ncs230 66\n");
+}
+
+static void test_run_session_early_close_fails(void) {
+    char received[256];
+    CHECK_EQ_INT(run_scripted_session("cs230 STATUS 1 + 1\n", received, sizeof received), EXIT_FAILURE);
+    CHECK_EQ_STR(received, "cs230 HELLO jdoe@umass.edu\ncs230 2\n");
+}
+
+static void test_run_session_rejects_garbage(void) {
+    char received[256];
+    CHECK_EQ_INT(run_scripted_session("cs230 WHAT\ncs230 STATUS 1 + 1\n", received, sizeof received), EXIT_FAILURE);
+    CHECK_EQ_STR(received, "cs230 HELLO jdoe@umass.edu\n");
+    CHECK_EQ_INT(run_scripted_session("cs230 STATUS 1 / 0\n", received, sizeof received), EXIT_FAILURE);
+    CHECK_EQ_STR(received, "cs230 HELLO jdoe@umass.edu\n");
+}
+
 int main(void) {
     test_identification();
     test_parse_port();
@@ -228,5 +403,17 @@ int main(void) {
     test_send_all_to_closed_peer_fails();
     test_connect_refused();
     test_verbose_flag();
+    test_parse_status_accepts_spec_example();
+    test_parse_status_accepts_negatives();
+    test_parse_status_rejects_malformed();
+    test_parse_bye();
+    test_evaluate_basic();
+    test_evaluate_division_truncates_toward_zero();
+    test_evaluate_division_by_zero_refused();
+    test_evaluate_overflow_refused();
+    test_handle_status_exact_bytes();
+    test_run_session_answers_then_prints_flag();
+    test_run_session_early_close_fails();
+    test_run_session_rejects_garbage();
     CHECK_REPORT("test_client");
 }
