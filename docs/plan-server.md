@@ -44,17 +44,17 @@ derivation (`sha256(id)`), which the server reproduces with an empty secret.
 
 ### Task 2: SHA-256, hex encoding, flag derivation
 Files: create `server/mathbot_server.c` (hash group only), `test/unit/test_mathbot_server.c`.
-- [ ] Tests first: empty string -> `e3b0c442…b855`, `"abc"` -> `ba7816bf…15ad`, the
+- [x] Tests first: empty string -> `e3b0c442…b855`, `"abc"` -> `ba7816bf…15ad`, the
   two-block `"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"` vector,
   a 1000-byte input that crosses several blocks (compared with a python hashlib
   run recorded in the test), hex encoding, `derive_flag` with empty and non-empty
   secret.
-- [ ] Implement `Sha256` (init/update/final/digest), `hex_encode`, `derive_flag`.
+- [x] Implement `Sha256` (init/update/final/digest), `hex_encode`, `derive_flag`.
   Round constants and initial hash live as `static const` locals, not globals.
 
 ### Task 3: Problems, arithmetic and protocol lines
 Files: extend both files.
-- [ ] Tests first: xorshift generator is deterministic and never returns 0;
+- [x] Tests first: xorshift generator is deterministic and never returns 0;
   `problem_count` in 300..2000 over many seeds; `make_problem` operands in
   -1000..1000, operator in `+-*/`, divisor never 0 over 10000 draws; `evaluate`
   truncates toward zero (`200/3 = 66`, `-7/2 = -3`, `7/-2 = -3`, `-7/-2 = 3`) and
@@ -63,43 +63,43 @@ Files: extend both files.
   missing prefix, trailing `\r`; `is_correct_answer` is byte-exact
   (`cs230 66` yes, `cs230  66`, `cs230 66 `, `66` no); `format_status` and
   `format_bye` produce the spec's lines.
-- [ ] Implement them.
+- [x] Implement them.
 
 ### Task 4: Listener, fork-per-connection session, main
 Files: finish `server/mathbot_server.c`; Makefile targets `server`, `server-run`;
 `check` covers the server; `test` builds the server; `.gitignore` unchanged
 (`build/` already ignored).
-- [ ] Config: `mathbot_server [PORT]`, PORT from argv, else `MATHBOT_PORT`, else
+- [x] Config: `mathbot_server [PORT]`, PORT from argv, else `MATHBOT_PORT`, else
   27993; port 0 means ephemeral; `MATHBOT_PROBLEMS` and `MATHBOT_SECRET` read once
   at startup into a `ServerConfig` passed down (no globals).
-- [ ] Listener: `socket`, `SO_REUSEADDR`, bind `0.0.0.0`, `listen`, `getsockname`,
+- [x] Listener: `socket`, `SO_REUSEADDR`, bind `0.0.0.0`, `listen`, `getsockname`,
   first stdout line `listening on port N`, one-second `SO_RCVTIMEO` on the
   listener so the accept loop polls the shutdown flag.
-- [ ] Signals via `sigaction`: `SIGCHLD` reaps with `waitpid(-1, WNOHANG)` in a loop
+- [x] Signals via `sigaction`: `SIGCHLD` reaps with `waitpid(-1, WNOHANG)` in a loop
   (errno saved), `SIGINT`/`SIGTERM` set the flag, `SIGPIPE` ignored; children
   restore the defaults.
-- [ ] Session: 30 s `SO_RCVTIMEO`, line framing across `recv` boundaries, HELLO
+- [x] Session: 30 s `SO_RCVTIMEO`, line framing across `recv` boundaries, HELLO
   check, seeded problems (`time ^ pid`), byte-exact answer check, close without
   BYE on any deviation, `cs230 <flag> BYE` after the last answer. One log line on
   connect and one on outcome, both with the peer address.
-- [ ] Smoke: `make server && build/mathbot_server 0` plus `build/client` against it.
+- [x] Smoke: `make server && build/mathbot_server 0` plus `build/client` against it.
 
 ### Task 5: e2e against the real server
 Files: `test/e2e/real_server.sh`, `test/e2e/lib.sh` (`start_server`, server-aware
 `assert_flag_captured`), `test/run_tests.sh` (export `SERVER_BIN`).
-- [ ] One client with `MATHBOT_PROBLEMS=400`, flag asserted; two clients at once,
+- [x] One client with `MATHBOT_PROBLEMS=400`, flag asserted; two clients at once,
   both flags asserted; a wrong HELLO over `python3 -I` sees the connection close
   without BYE; `SIGTERM` makes the server exit 0.
 
 ### Task 6: `make autograde`
 Files: `test/autograde.sh`, Makefile target.
-- [ ] `dist`, `gcc client.c -o a.out` in `dist/`, server on an ephemeral port,
+- [x] `dist`, `gcc client.c -o a.out` in `dist/`, server on an ephemeral port,
   client run with `AUTOGRADE_ID` (default `autograde@umass.edu`), stdout compared
   with `python3 -I` hashlib, PASS/FAIL, server always stopped.
 
 ### Task 7: Container image
 Files: `server/Dockerfile`, `server/compose.yaml`, `.dockerignore`.
-- [ ] Multi-stage on `debian:bookworm-slim`, strict flags, non-root user,
+- [x] Multi-stage on `debian:bookworm-slim`, strict flags, non-root user,
   `EXPOSE 27993`, `ENV MATHBOT_PORT=27993`, `ENTRYPOINT`. Not buildable in this
   sandbox (Docker socket denied, podman cannot start); recorded in the docs.
 
@@ -108,6 +108,9 @@ Files: `docs/server.md`, `README.txt`, `docs/design.md` section 8,
 `docs/research.md` new sections (SHA-256, fork/SIGCHLD, SO_REUSEADDR/SO_RCVTIMEO).
 
 ### Task 9: Independent review and fixes
-- [ ] A reviewer reads the spec, the server and the Dockerfile and lists defects;
-  fix them; final gate:
+- [x] A reviewer reads the spec, the server and the Dockerfile and lists defects;
+  fix them (done: `MATHBOT_SEED`, malformed-line outcome, NUL-safe framing,
+  child exit status, harness environment scrub, `build/server/` objects, docs
+  corrections, six more real-server scenarios; negative operands and the
+  case-insensitive domain kept as deliberate, documented decisions); final gate:
   `make clean && make && make server && make check && make test && make dist && make autograde`.

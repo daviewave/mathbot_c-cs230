@@ -278,17 +278,24 @@ static void test_load_config(void) {
     set_variable(PORT_VARIABLE, NULL);
     set_variable(PROBLEMS_VARIABLE, NULL);
     set_variable(SECRET_VARIABLE, NULL);
+    set_variable(SEED_VARIABLE, NULL);
     CHECK(load_config(1, no_port, &config));
     CHECK_EQ_INT(config.port, DEFAULT_PORT);
     CHECK_EQ_INT(config.problem_override, 0);
+    CHECK_EQ_INT(config.seed_override, 0);
     CHECK_EQ_STR(config.secret, "");
     set_variable(PORT_VARIABLE, "5555");
     set_variable(PROBLEMS_VARIABLE, "400");
     set_variable(SECRET_VARIABLE, "s3cret");
+    set_variable(SEED_VARIABLE, "77");
     CHECK(load_config(1, no_port, &config));
     CHECK_EQ_INT(config.port, 5555);
     CHECK_EQ_INT(config.problem_override, 400);
+    CHECK_EQ_INT(config.seed_override, 77);
     CHECK_EQ_STR(config.secret, "s3cret");
+    set_variable(SEED_VARIABLE, "0");
+    CHECK(!load_config(1, no_port, &config));
+    set_variable(SEED_VARIABLE, NULL);
     CHECK(load_config(2, with_port, &config));
     CHECK_EQ_INT(config.port, 4242);
     CHECK(!load_config(2, bad_port, &config));
@@ -340,7 +347,32 @@ static void test_receive_line_rejects_overlong_line(void) {
     memset(filler, 'x', sizeof filler);
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     CHECK(write(pair[1], filler, sizeof filler) == (ssize_t)sizeof filler);
-    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_ERROR);
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_PROTOCOL_ERROR);
+    CHECK(close(pair[1]) == 0);
+    CHECK(close(pair[0]) == 0);
+}
+
+/* A complete line that does not fit the caller's buffer is a protocol error, not a retry. */
+static void test_receive_line_rejects_line_over_capacity(void) {
+    int pair[2];
+    LineBuffer buffer = { {0}, 0 };
+    char line[8];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    write_text(pair[1], "cs230 HELLO jdoe@umass.edu\n");
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_PROTOCOL_ERROR);
+    CHECK(close(pair[1]) == 0);
+    CHECK(close(pair[0]) == 0);
+}
+
+/* A NUL byte inside a line would hide the bytes after it from strcmp; the line is rejected. */
+static void test_receive_line_rejects_embedded_nul(void) {
+    int pair[2];
+    LineBuffer buffer = { {0}, 0 };
+    char line[RECEIVE_BUFFER_SIZE];
+    static const char with_nul[] = "cs230 66\0junk\n";
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    CHECK(write(pair[1], with_nul, sizeof with_nul - 1) == (ssize_t)(sizeof with_nul - 1));
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_PROTOCOL_ERROR);
     CHECK(close(pair[1]) == 0);
     CHECK(close(pair[0]) == 0);
 }
@@ -365,18 +397,36 @@ static void test_describe_outcome(void) {
     CHECK_EQ_STR(describe_outcome(SESSION_WRONG_ANSWER), "closed: wrong answer");
     CHECK_EQ_STR(describe_outcome(SESSION_CLIENT_LEFT), "closed: client hung up");
     CHECK_EQ_STR(describe_outcome(SESSION_TIMED_OUT), "closed: timed out");
+    CHECK_EQ_STR(describe_outcome(SESSION_MALFORMED_LINE), "closed: malformed line");
     CHECK_EQ_STR(describe_outcome(SESSION_FAILED), "closed: socket error");
 }
 
 /* The override wins; otherwise the count is the seeded random one in range. */
 static void test_session_problem_count(void) {
-    ServerConfig config = { 0, 400, "" };
+    ServerConfig config = { 0, 400, 0, "" };
     uint32_t state = 7;
     long count;
     CHECK_EQ_INT(session_problem_count(&config, &state), 400);
     config.problem_override = 0;
     count = session_problem_count(&config, &state);
     CHECK(count >= PROBLEMS_MIN && count <= PROBLEMS_MAX);
+}
+
+/* MATHBOT_SEED makes every session draw the same problems. */
+static void test_session_seed(void) {
+    ServerConfig config = { 0, 0, 12345, "" };
+    CHECK_EQ_INT(session_seed(&config), 12345);
+    CHECK_EQ_INT(session_seed(&config), 12345);
+}
+
+static void test_parse_seed_override(void) {
+    uint32_t seed = 0;
+    CHECK(parse_seed_override("1", &seed) && seed == 1);
+    CHECK(parse_seed_override("4294967295", &seed) && seed == UINT32_MAX);
+    CHECK(!parse_seed_override("0", &seed));
+    CHECK(!parse_seed_override("4294967296", &seed));
+    CHECK(!parse_seed_override("-1", &seed));
+    CHECK(!parse_seed_override("x", &seed));
 }
 
 int main(void) {
@@ -397,8 +447,12 @@ int main(void) {
     test_load_config();
     test_receive_line_frames_across_boundaries();
     test_receive_line_rejects_overlong_line();
+    test_receive_line_rejects_line_over_capacity();
+    test_receive_line_rejects_embedded_nul();
     test_receive_line_times_out();
     test_describe_outcome();
     test_session_problem_count();
+    test_session_seed();
+    test_parse_seed_override();
     CHECK_REPORT("test_mathbot_server");
 }

@@ -26,7 +26,7 @@ DEBUG_BIN = $(BUILD)/debug/client
 # The server is built from its own directory with the client's flags; it is never submitted.
 SERVER_DIR = server
 SERVER_SOURCES = $(wildcard $(SERVER_DIR)/*.c)
-SERVER_OBJECTS = $(patsubst $(SERVER_DIR)/%.c,$(BUILD)/%.o,$(SERVER_SOURCES))
+SERVER_OBJECTS = $(patsubst $(SERVER_DIR)/%.c,$(BUILD)/server/%.o,$(SERVER_SOURCES))
 SERVER_BIN = $(BUILD)/mathbot_server
 
 # Defaults for `make run` and `make server-run`: the local server on the course's port.
@@ -48,13 +48,14 @@ $(BIN): $(OBJECTS)
 $(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# server: the local math-speak server into build/ (same flags, same rules, own source directory).
+# server: the local math-speak server, same flags; its objects live in build/server/ so a
+# src/ file of the same name could never shadow them.
 server: $(SERVER_BIN)
 
 $(SERVER_BIN): $(SERVER_OBJECTS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD)/%.o: $(SERVER_DIR)/%.c | $(BUILD)
+$(BUILD)/server/%.o: $(SERVER_DIR)/%.c | $(BUILD)/server
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # server-run: serve on PORT (default 27993) until Ctrl-C; the client then targets 127.0.0.1.
@@ -70,7 +71,7 @@ $(DEBUG_BIN): $(DEBUG_OBJECTS)
 $(BUILD)/debug/%.o: $(SRC_DIR)/%.c | $(BUILD)/debug
 	$(CC) $(DEBUGFLAGS) $(STD) $(WARNINGS) -MMD -MP -c $< -o $@
 
-$(BUILD) $(BUILD)/debug $(BUILD)/check:
+$(BUILD) $(BUILD)/debug $(BUILD)/check $(BUILD)/server:
 	mkdir -p $@
 
 # test: run_tests.sh compiles the unit tests with the same flags and hands both binaries to the e2e scripts.

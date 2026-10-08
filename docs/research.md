@@ -342,18 +342,21 @@ POSIX.1-2008 or ISO C99, so nothing depends on a recent toolchain.
 
 ### Practices adopted in this code
 
-- `test/e2e/mock_server.py` binds `127.0.0.1:0`, prints the port on its
-  first stdout line and flushes, then `handle_request()`s one client. The
-  shell driver reads that line, runs `build/client id port 127.0.0.1` under
-  `timeout`, and compares the printed flag with the one the mock derives
-  from the id (`sha256(id)` hex, 64 characters, matching the spec's format).
-- The problem count comes from `random.Random(MATHBOT_SEED)` in 300..2000;
-  operands include negatives; a fixed fraction of STATUS lines are sent
-  fragmented, another fraction coalesced with the following STATUS.
-- Wrong answer: the mock closes the socket without BYE; the e2e case asserts
-  the client exits non-zero with a "server closed" message. A wrong-answer
-  mode is driven by an environment variable so the mock misbehaves, not the
-  client.
+- `test/e2e/mock_server.py` binds `127.0.0.1:0`, writes the port atomically
+  to the file named by `--port-file`, then accepts one client with a plain
+  `socket` and a `LineReader`. The shell driver (`lib.sh`) polls that file,
+  runs `build/client id port 127.0.0.1` under `timeout`, and compares the
+  printed flag with the one the mock derives from the id (`sha256(id)` hex,
+  64 characters, matching the spec's format).
+- The problem count comes from `random.Random(--seed)` in 300..2000 unless
+  `--problems` fixes it; operands include negatives; with `--fragment` every
+  7th message is split across two writes, with `--pipeline` every 5th STATUS
+  is coalesced with the next, `--crlf` ends lines with CRLF.
+- Wrong answer: with `--reject` the mock closes the socket without BYE after
+  the first answer; the e2e case asserts the client exits non-zero with a
+  "server closed" message. `--inject LINE` sends an arbitrary line instead of
+  the first problem. All misbehaviour is driven by flags so the mock, not the
+  client, is what deviates.
 - Refused connection: the driver obtains a closed port by binding and
   immediately closing a socket in Python, then runs the client against it.
 
@@ -436,11 +439,16 @@ POSIX.1-2008 or ISO C99, so nothing depends on a recent toolchain.
   `while (waitpid(-1, NULL, WNOHANG) > 0);` reaps every finished child in one
   go; `waitpid` is async-signal-safe and `errno` must be saved and restored
   in the handler because it is clobbered. `SA_NOCLDSTOP` keeps stopped
-  children from raising the signal; `SA_RESTART` on the SIGCHLD action keeps
-  `accept` from returning `EINTR` on every session end.
+  children from raising the signal. `SA_RESTART` on the SIGCHLD action would
+  normally keep `accept` from returning `EINTR` on every session end, but
+  signal(7) exempts sockets that carry a timeout from being restarted, and
+  the listener does (next bullet): verified locally, SIGCHLD under
+  `SA_RESTART` still returned `EINTR` from `accept` once `SO_RCVTIMEO` was
+  set. So `EINTR` is simply one of the transient `accept` failures the loop
+  retries; the flag is harmless and kept.
 - `SIGINT`/`SIGTERM` handlers must only set a `volatile sig_atomic_t`.
-  Without `SA_RESTART`, a blocking `accept` returns `EINTR` when they run, so
-  the loop can check the flag. There is still a window between the check and
+  A blocking `accept` returns `EINTR` when they run, so the loop can check
+  the flag. There is still a window between the check and
   the call in which a signal is missed; the classic cures are a self-pipe or
   `pselect`. socket(7) documents `SO_RCVTIMEO` for calls that "perform socket
   I/O", and Linux applies it to `accept` as well: verified locally on kernel

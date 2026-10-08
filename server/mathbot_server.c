@@ -23,7 +23,7 @@
 enum {
     DEFAULT_PORT = 27993,
     MAX_PORT = 65535,
-    MAX_ARGUMENT_COUNT = 2,
+    MAX_ARGUMENTS = 1,
     LISTEN_BACKLOG = 16,
     RECEIVE_BUFFER_SIZE = 4096,
     SESSION_TIMEOUT_SECONDS = 30,
@@ -48,6 +48,7 @@ enum {
 #define PORT_VARIABLE "MATHBOT_PORT"
 #define PROBLEMS_VARIABLE "MATHBOT_PROBLEMS"
 #define SECRET_VARIABLE "MATHBOT_SECRET"
+#define SEED_VARIABLE "MATHBOT_SEED"
 #define OPERATORS "+-*/"
 #define IDENTIFICATION_DOMAIN "@umass.edu"
 #define PROTOCOL_PREFIX "cs230 "
@@ -55,10 +56,12 @@ enum {
 #define STATUS_PREFIX "cs230 STATUS "
 #define BYE_SUFFIX " BYE"
 
-/* Settings read once at startup and handed to every session; never global. */
+/* Settings read once at startup and handed to every session; never global.
+ * seed_override is 0 when MATHBOT_SEED is unset and every session seeds itself. */
 typedef struct {
     unsigned short port;
     long problem_override;
+    uint32_t seed_override;
     const char *secret;
 } ServerConfig;
 
@@ -75,13 +78,21 @@ typedef struct {
     size_t used;
 } LineBuffer;
 
-/* Outcome of waiting for one line. */
+/* Outcome of waiting for one line; RECEIVE_PROTOCOL_ERROR is a line too long or holding a NUL. */
 typedef enum {
     RECEIVE_LINE,
     RECEIVE_EOF,
     RECEIVE_TIMEOUT,
+    RECEIVE_PROTOCOL_ERROR,
     RECEIVE_ERROR
 } ReceiveResult;
+
+/* What line_buffer_take_line found. */
+typedef enum {
+    TAKE_LINE,
+    TAKE_INCOMPLETE,
+    TAKE_MALFORMED
+} TakeResult;
 
 /* How a session step ended; everything but SESSION_OK stops the session. */
 typedef enum {
@@ -91,6 +102,7 @@ typedef enum {
     SESSION_WRONG_ANSWER,
     SESSION_CLIENT_LEFT,
     SESSION_TIMED_OUT,
+    SESSION_MALFORMED_LINE,
     SESSION_FAILED
 } SessionOutcome;
 
@@ -430,6 +442,16 @@ static bool parse_problem_override(const char *text, long *count) {
     return parse_bounded_decimal(text, MAX_PROBLEM_OVERRIDE, count) && *count >= 1;
 }
 
+/* Parses the MATHBOT_SEED override in 1..UINT32_MAX (0 would mean "unset"). */
+static bool parse_seed_override(const char *text, uint32_t *seed) {
+    long value;
+    if (!parse_bounded_decimal(text, (long)UINT32_MAX, &value) || value < 1) {
+        return false;
+    }
+    *seed = (uint32_t)value;
+    return true;
+}
+
 /* The environment variable's value, or NULL when it is unset or empty. */
 static const char *variable_or_null(const char *name) {
     const char *value = getenv(name);
@@ -464,14 +486,29 @@ static bool load_problem_override(long *override) {
     return true;
 }
 
+/* Reads MATHBOT_SEED into the override, 0 when unset; reports bad text. */
+static bool load_seed_override(uint32_t *override) {
+    const char *text = variable_or_null(SEED_VARIABLE);
+    if (text == NULL) {
+        *override = 0;
+        return true;
+    }
+    if (!parse_seed_override(text, override)) {
+        fprintf(stderr, "invalid %s '%s': expected 1..%lu\n", SEED_VARIABLE, text, (unsigned long)UINT32_MAX);
+        return false;
+    }
+    return true;
+}
+
 /* Validates argv and the environment into config; false after reporting the reason. */
 static bool load_config(int argc, char **argv, ServerConfig *config) {
     const char *secret;
-    if (argc > MAX_ARGUMENT_COUNT) {
-        fprintf(stderr, "expected at most 1 argument, got %d\n", argc - 1);
+    if (argc - 1 > MAX_ARGUMENTS) {
+        fprintf(stderr, "expected at most %d argument, got %d\n", MAX_ARGUMENTS, argc - 1);
         return false;
     }
-    if (!load_port(argc, argv, &config->port) || !load_problem_override(&config->problem_override)) {
+    if (!load_port(argc, argv, &config->port) || !load_problem_override(&config->problem_override) ||
+        !load_seed_override(&config->seed_override)) {
         return false;
     }
     secret = getenv(SECRET_VARIABLE);
@@ -610,13 +647,13 @@ static void format_peer(const struct sockaddr_in *address, char *text, size_t ca
 
 /* Writes one log line to stdout and flushes it so forked children never duplicate it. */
 static void log_line(const char *message) {
-    printf("%s\n", message);
+    (void)printf("%s\n", message);
     (void)fflush(stdout);
 }
 
 /* Writes one per-session log line: "<peer> <message>". */
 static void log_session(const char *peer, const char *message) {
-    printf("%s %s\n", peer, message);
+    (void)printf("%s %s\n", peer, message);
     (void)fflush(stdout);
 }
 
@@ -630,23 +667,24 @@ static bool line_buffer_append(LineBuffer *buffer, const char *bytes, size_t cou
     return true;
 }
 
-/* Copies the first complete line (without its newline) into line and removes it
- * from the buffer; false when no complete line is buffered or it exceeds capacity. */
-static bool line_buffer_take_line(LineBuffer *buffer, char *line, size_t capacity) {
+/* Copies the first complete line (without its newline) into line and removes it from
+ * the buffer. A line that exceeds capacity or carries a NUL byte, which strcmp could
+ * not see, is malformed. */
+static TakeResult line_buffer_take_line(LineBuffer *buffer, char *line, size_t capacity) {
     const char *newline = memchr(buffer->data, '\n', buffer->used);
     size_t length;
     if (newline == NULL) {
-        return false;
+        return TAKE_INCOMPLETE;
     }
     length = (size_t)(newline - buffer->data);
-    if (length >= capacity) {
-        return false;
+    if (length >= capacity || memchr(buffer->data, '\0', length) != NULL) {
+        return TAKE_MALFORMED;
     }
     memcpy(line, buffer->data, length);
     line[length] = '\0';
     buffer->used -= length + 1;
     memmove(buffer->data, buffer->data + length + 1, buffer->used);
-    return true;
+    return TAKE_LINE;
 }
 
 /* Classifies a failed recv: a timeout, or an error worth reporting. */
@@ -660,7 +698,8 @@ static ReceiveResult classify_receive_failure(void) {
 
 /* Reads from the socket until one complete line is available in line. */
 static ReceiveResult receive_line(int socket_fd, LineBuffer *buffer, char *line, size_t capacity) {
-    while (!line_buffer_take_line(buffer, line, capacity)) {
+    TakeResult taken;
+    while ((taken = line_buffer_take_line(buffer, line, capacity)) == TAKE_INCOMPLETE) {
         char chunk[RECEIVE_BUFFER_SIZE];
         ssize_t received = recv(socket_fd, chunk, sizeof chunk, 0);
         if (received < 0 && errno == EINTR) {
@@ -673,11 +712,10 @@ static ReceiveResult receive_line(int socket_fd, LineBuffer *buffer, char *line,
             return RECEIVE_EOF;
         }
         if (!line_buffer_append(buffer, chunk, (size_t)received)) {
-            fprintf(stderr, "protocol error: line longer than %d bytes\n", RECEIVE_BUFFER_SIZE);
-            return RECEIVE_ERROR;
+            return RECEIVE_PROTOCOL_ERROR;
         }
     }
-    return RECEIVE_LINE;
+    return taken == TAKE_LINE ? RECEIVE_LINE : RECEIVE_PROTOCOL_ERROR;
 }
 
 /* Sends every byte, looping because a stream send may write fewer bytes than asked. */
@@ -706,6 +744,8 @@ static SessionOutcome outcome_of_receive(ReceiveResult result) {
         return SESSION_CLIENT_LEFT;
     case RECEIVE_TIMEOUT:
         return SESSION_TIMED_OUT;
+    case RECEIVE_PROTOCOL_ERROR:
+        return SESSION_MALFORMED_LINE;
     default:
         return SESSION_FAILED;
     }
@@ -724,13 +764,19 @@ static const char *describe_outcome(SessionOutcome outcome) {
         return "closed: client hung up";
     case SESSION_TIMED_OUT:
         return "closed: timed out";
+    case SESSION_MALFORMED_LINE:
+        return "closed: malformed line";
     default:
         return "closed: socket error";
     }
 }
 
-/* A per-connection seed: wall-clock time mixed with the child's pid. */
-static uint32_t session_seed(void) {
+/* The seed for this session: MATHBOT_SEED verbatim when set (every session then asks the
+ * same problems, which is what a reproducible test wants), else the time mixed with the pid. */
+static uint32_t session_seed(const ServerConfig *config) {
+    if (config->seed_override != 0) {
+        return config->seed_override;
+    }
     return (uint32_t)time(NULL) * 2654435761u ^ (uint32_t)getpid();
 }
 
@@ -791,7 +837,7 @@ static SessionOutcome send_bye(int connection, const char *secret, const char *i
 static SessionOutcome run_session(int connection, const ServerConfig *config) {
     LineBuffer buffer = { {0}, 0 };
     char identification[MAX_LINE_LENGTH];
-    uint32_t state = session_seed();
+    uint32_t state = session_seed(config);
     long count = session_problem_count(config, &state);
     SessionOutcome outcome = receive_hello(connection, &buffer, identification, sizeof identification);
     if (outcome == SESSION_OK) {
@@ -803,8 +849,8 @@ static SessionOutcome run_session(int connection, const ServerConfig *config) {
     return outcome;
 }
 
-/* Logs the connection, runs the session under the recv timeout, logs the outcome. */
-static void serve_connection(int connection, const ServerConfig *config, const char *peer) {
+/* Logs the connection, runs the session under the recv timeout, logs and returns the outcome. */
+static SessionOutcome serve_connection(int connection, const ServerConfig *config, const char *peer) {
     struct timeval timeout = { SESSION_TIMEOUT_SECONDS, 0 };
     SessionOutcome outcome = SESSION_FAILED;
     log_session(peer, "connected");
@@ -812,15 +858,18 @@ static void serve_connection(int connection, const ServerConfig *config, const c
         outcome = run_session(connection, config);
     }
     log_session(peer, describe_outcome(outcome));
+    return outcome;
 }
 
-/* The child's whole life: drop the listener, serve, close, exit. */
+/* The child's whole life: drop the listener, serve, close, exit. The status is
+ * EXIT_FAILURE only when the server itself failed; a misbehaving client is not our error. */
 static void run_child(int listener, int connection, const ServerConfig *config, const char *peer) {
+    SessionOutcome outcome;
     (void)close_socket(listener);
     (void)restore_default_signals();
-    serve_connection(connection, config, peer);
+    outcome = serve_connection(connection, config, peer);
     (void)close_socket(connection);
-    exit(EXIT_SUCCESS);
+    exit(outcome == SESSION_FAILED ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
 /* ---- Accept loop (the parent) ------------------------------------------- */

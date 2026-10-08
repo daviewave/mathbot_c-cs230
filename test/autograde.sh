@@ -35,8 +35,9 @@ compile_like_the_autograder() {
     (cd "$DIST" && gcc client.c -o a.out) || fail "gcc client.c -o a.out failed"
 }
 
+# The grader's server must not inherit a developer's shortcuts (fewer problems, another secret).
 start_server() {
-    MATHBOT_SECRET= "$SERVER_BIN" 0 > "$SERVER_LOG" 2>&1 &
+    env -u MATHBOT_PROBLEMS -u MATHBOT_SEED -u MATHBOT_PORT MATHBOT_SECRET= "$SERVER_BIN" 0 > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
     local tries=0
     while ! grep -q '^listening on port ' "$SERVER_LOG" 2>/dev/null; do

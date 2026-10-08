@@ -80,10 +80,12 @@ start_mock() {
 }
 
 # start_server [VAR=value ...]: launches the real server on an ephemeral port with the given
-# environment and exports SERVER_PORT once it has announced the port.
+# environment (the caller's MATHBOT_* settings are scrubbed first, so only the arguments count)
+# and exports SERVER_PORT once it has announced the port.
 start_server() {
     : > "$SERVER_LOG"
-    env "$@" "$SERVER_BIN" 0 > "$SERVER_LOG" 2> "$SERVER_ERR" &
+    env -u MATHBOT_PROBLEMS -u MATHBOT_SEED -u MATHBOT_PORT MATHBOT_SECRET= "$@" "$SERVER_BIN" 0 \
+        > "$SERVER_LOG" 2> "$SERVER_ERR" &
     SERVER_PID=$!
     local tries=0
     while ! grep -q '^listening on port ' "$SERVER_LOG" 2>/dev/null; do
