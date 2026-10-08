@@ -86,11 +86,160 @@ static void test_derive_flag(void) {
     CHECK_EQ_STR(flag, "683bd731d86c4622ed9407ef435386ff861837d0219cc62ea2b1e87592b15210");
 }
 
+/* xorshift32 is deterministic for a seed, never yields 0, and a zero seed is repaired. */
+static void test_random_generator(void) {
+    uint32_t first = 12345, second = 12345, zero = 0;
+    int index;
+    bool saw_zero = false;
+    CHECK_EQ_INT(next_random(&first), next_random(&second));
+    CHECK_EQ_INT(next_random(&first), next_random(&second));
+    CHECK(next_random(&zero) != 0);
+    for (index = 0; index < 100000; index++) {
+        saw_zero = saw_zero || next_random(&first) == 0;
+    }
+    CHECK(!saw_zero);
+    CHECK_EQ_INT(random_in_range(&first, 5, 5), 5);
+    for (index = 0; index < 10000; index++) {
+        long value = random_in_range(&first, -3, 3);
+        if (value < -3 || value > 3) {
+            CHECK(value >= -3 && value <= 3);
+        }
+    }
+}
+
+static void test_problem_count_range(void) {
+    uint32_t state = 1;
+    int index;
+    long lowest = PROBLEMS_MAX, highest = PROBLEMS_MIN;
+    for (index = 0; index < 100000; index++) {
+        long count = problem_count(&state);
+        if (count < lowest) {
+            lowest = count;
+        }
+        if (count > highest) {
+            highest = count;
+        }
+    }
+    CHECK(lowest >= PROBLEMS_MIN);
+    CHECK(highest <= PROBLEMS_MAX);
+    CHECK_EQ_INT(lowest, PROBLEMS_MIN);
+    CHECK_EQ_INT(highest, PROBLEMS_MAX);
+}
+
+/* Operands stay in -1000..1000, the operator is one of four, the divisor is never 0. */
+static void test_make_problem(void) {
+    uint32_t state = 99;
+    int index;
+    bool saw_division = false, saw_negative = false;
+    for (index = 0; index < 100000; index++) {
+        MathProblem problem = make_problem(&state);
+        bool in_range = problem.left >= OPERAND_MIN && problem.left <= OPERAND_MAX &&
+                        problem.right >= OPERAND_MIN && problem.right <= OPERAND_MAX;
+        bool known_operator = strchr(OPERATORS, problem.operation) != NULL && problem.operation != '\0';
+        if (!in_range || !known_operator || (problem.operation == '/' && problem.right == 0)) {
+            CHECK(in_range);
+            CHECK(known_operator);
+            CHECK(!(problem.operation == '/' && problem.right == 0));
+        }
+        saw_division = saw_division || problem.operation == '/';
+        saw_negative = saw_negative || problem.left < 0 || problem.right < 0;
+    }
+    CHECK(saw_division);
+    CHECK(saw_negative);
+}
+
+/* Builds a problem literal. */
+static MathProblem problem_of(long long left, char operation, long long right) {
+    MathProblem problem;
+    problem.left = left;
+    problem.operation = operation;
+    problem.right = right;
+    return problem;
+}
+
+/* Evaluates left <operation> right. */
+static long long answer_of(long long left, char operation, long long right) {
+    MathProblem problem = problem_of(left, operation, right);
+    return evaluate(&problem);
+}
+
+static void test_evaluate(void) {
+    CHECK_EQ_INT(answer_of(505, '*', 700), 353500);
+    CHECK_EQ_INT(answer_of(200, '/', 3), 66);
+    CHECK_EQ_INT(answer_of(-7, '/', 2), -3);
+    CHECK_EQ_INT(answer_of(7, '/', -2), -3);
+    CHECK_EQ_INT(answer_of(-7, '/', -2), 3);
+    CHECK_EQ_INT(answer_of(0, '/', -5), 0);
+    CHECK_EQ_INT(answer_of(-1000, '*', -1000), 1000000);
+    CHECK_EQ_INT(answer_of(-1000, '+', 1000), 0);
+    CHECK_EQ_INT(answer_of(-1000, '-', 1000), -2000);
+    CHECK_EQ_INT(answer_of(3, '-', -4), 7);
+}
+
+static void test_parse_hello(void) {
+    char identification[MAX_LINE_LENGTH];
+    CHECK(parse_hello("cs230 HELLO jdoe@umass.edu", identification, sizeof identification));
+    CHECK_EQ_STR(identification, "jdoe@umass.edu");
+    CHECK(parse_hello("cs230 HELLO JDoe@UMass.EDU", identification, sizeof identification));
+    CHECK_EQ_STR(identification, "JDoe@UMass.EDU");
+    CHECK(!parse_hello("cs230 HELLO ", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 HELLO", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 HELLO @umass.edu", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 HELLO jdoe@gmail.com", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 HELLO jdoe@umass.edu extra", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 HELLO jdoe@umass.edu ", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 HELLO jdoe@umass.edu\r", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 HELLO  jdoe@umass.edu", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 hello jdoe@umass.edu", identification, sizeof identification));
+    CHECK(!parse_hello("HELLO jdoe@umass.edu", identification, sizeof identification));
+    CHECK(!parse_hello("", identification, sizeof identification));
+    CHECK(!parse_hello("cs230 HELLO jdoe@umass.edu", identification, 10));
+}
+
+static void test_is_correct_answer(void) {
+    MathProblem problem = problem_of(200, '/', 3);
+    CHECK(is_correct_answer(&problem, "cs230 66"));
+    CHECK(!is_correct_answer(&problem, "cs230 67"));
+    CHECK(!is_correct_answer(&problem, "cs230  66"));
+    CHECK(!is_correct_answer(&problem, "cs230 66 "));
+    CHECK(!is_correct_answer(&problem, "cs230 66\r"));
+    CHECK(!is_correct_answer(&problem, "66"));
+    CHECK(!is_correct_answer(&problem, "cs230 +66"));
+    CHECK(!is_correct_answer(&problem, ""));
+    problem = problem_of(-7, '/', 2);
+    CHECK(is_correct_answer(&problem, "cs230 -3"));
+    CHECK(!is_correct_answer(&problem, "cs230 -4"));
+}
+
+/* The too-small capacities are volatile so the compiler cannot prove the truncation at build time. */
+static void test_format_lines(void) {
+    char line[MAX_LINE_LENGTH];
+    volatile size_t too_small_for_status = 5;
+    volatile size_t too_small_for_bye = 20;
+    MathProblem problem = problem_of(505, '*', 700);
+    CHECK(format_status(&problem, line, sizeof line));
+    CHECK_EQ_STR(line, "cs230 STATUS 505 * 700\n");
+    problem = problem_of(-5, '-', -12);
+    CHECK(format_status(&problem, line, sizeof line));
+    CHECK_EQ_STR(line, "cs230 STATUS -5 - -12\n");
+    CHECK(!format_status(&problem, line, too_small_for_status));
+    CHECK(format_bye("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", line, sizeof line));
+    CHECK_EQ_STR(line, "cs230 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef BYE\n");
+    CHECK(!format_bye("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", line, too_small_for_bye));
+}
+
 int main(void) {
     test_sha256_standard_vectors();
     test_sha256_padding_boundaries();
     test_sha256_incremental_updates();
     test_hex_encode();
     test_derive_flag();
+    test_random_generator();
+    test_problem_count_range();
+    test_make_problem();
+    test_evaluate();
+    test_parse_hello();
+    test_is_correct_answer();
+    test_format_lines();
     CHECK_REPORT("test_mathbot_server");
 }

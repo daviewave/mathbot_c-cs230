@@ -3,6 +3,7 @@
  * problems and ends a fully correct session with a SHA-256 flag. Design notes
  * live in docs/server.md. */
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -10,6 +11,11 @@
 #include <string.h>
 
 enum {
+    PROBLEMS_MIN = 300,
+    PROBLEMS_MAX = 2000,
+    OPERAND_MIN = -1000,
+    OPERAND_MAX = 1000,
+    MAX_LINE_LENGTH = 512,
     SHA256_BLOCK_LENGTH = 64,
     SHA256_DIGEST_LENGTH = 32,
     SHA256_HEX_LENGTH = 64,
@@ -19,6 +25,20 @@ enum {
     SHA256_LENGTH_FIELD = 8,
     FLAG_LENGTH = SHA256_HEX_LENGTH
 };
+
+#define OPERATORS "+-*/"
+#define IDENTIFICATION_DOMAIN "@umass.edu"
+#define PROTOCOL_PREFIX "cs230 "
+#define HELLO_PREFIX "cs230 HELLO "
+#define STATUS_PREFIX "cs230 STATUS "
+#define BYE_SUFFIX " BYE"
+
+/* One arithmetic problem: left <operation> right. */
+typedef struct {
+    long long left;
+    char operation;
+    long long right;
+} MathProblem;
 
 /* SHA-256 running state: the eight hash words, bytes seen, and the partial block. */
 typedef struct {
@@ -212,4 +232,118 @@ static void derive_flag(const char *secret, const char *identification, char *fl
     sha256_update(&hash, (const unsigned char *)identification, strlen(identification));
     sha256_final(&hash, digest);
     hex_encode(digest, sizeof digest, flag);
+}
+
+/* ---- Problems and math speak ------------------------------------------- */
+
+/* Advances an xorshift32 generator and returns the next non-zero value. */
+static uint32_t next_random(uint32_t *state) {
+    uint32_t value = *state == 0 ? 1 : *state;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    *state = value;
+    return value;
+}
+
+/* A pseudo-random value in low..high inclusive (low <= high). */
+static long random_in_range(uint32_t *state, long low, long high) {
+    uint32_t span = (uint32_t)(high - low + 1);
+    return low + (long)(next_random(state) % span);
+}
+
+/* How many problems this session asks: the spec's "no less than 300, no more than 2000". */
+static long problem_count(uint32_t *state) {
+    return random_in_range(state, PROBLEMS_MIN, PROBLEMS_MAX);
+}
+
+/* Draws one problem with operands in OPERAND_MIN..OPERAND_MAX and a non-zero divisor. */
+static MathProblem make_problem(uint32_t *state) {
+    MathProblem problem;
+    problem.left = random_in_range(state, OPERAND_MIN, OPERAND_MAX);
+    problem.operation = OPERATORS[random_in_range(state, 0, (long)strlen(OPERATORS) - 1)];
+    problem.right = random_in_range(state, OPERAND_MIN, OPERAND_MAX);
+    while (problem.operation == '/' && problem.right == 0) {
+        problem.right = random_in_range(state, OPERAND_MIN, OPERAND_MAX);
+    }
+    return problem;
+}
+
+/* The answer the client must send; division truncates toward zero as C99 6.5.5
+ * prescribes. Operands come from make_problem, so no overflow and no zero divisor. */
+static long long evaluate(const MathProblem *problem) {
+    switch (problem->operation) {
+    case '+':
+        return problem->left + problem->right;
+    case '-':
+        return problem->left - problem->right;
+    case '*':
+        return problem->left * problem->right;
+    default:
+        return problem->left / problem->right;
+    }
+}
+
+/* True when left and right are equal ignoring ASCII case. */
+static bool equals_ignoring_case(const char *left, const char *right) {
+    for (; *left != '\0' && *right != '\0'; left++, right++) {
+        if (tolower((unsigned char)*left) != tolower((unsigned char)*right)) {
+            return false;
+        }
+    }
+    return *left == *right;
+}
+
+/* True when any character of text is whitespace. */
+static bool contains_whitespace(const char *text) {
+    for (; *text != '\0'; text++) {
+        if (isspace((unsigned char)*text)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True for a non-empty token without whitespace ending in @umass.edu (any case). */
+static bool is_valid_identification(const char *identification) {
+    size_t length = strlen(identification);
+    size_t domain_length = strlen(IDENTIFICATION_DOMAIN);
+    if (length <= domain_length || contains_whitespace(identification)) {
+        return false;
+    }
+    return equals_ignoring_case(identification + length - domain_length, IDENTIFICATION_DOMAIN);
+}
+
+/* Parses "cs230 HELLO <id>" with a valid id into identification; false otherwise. */
+static bool parse_hello(const char *line, char *identification, size_t capacity) {
+    size_t prefix_length = strlen(HELLO_PREFIX);
+    const char *candidate = line + prefix_length;
+    if (strncmp(line, HELLO_PREFIX, prefix_length) != 0 || strlen(candidate) >= capacity) {
+        return false;
+    }
+    if (!is_valid_identification(candidate)) {
+        return false;
+    }
+    strcpy(identification, candidate);
+    return true;
+}
+
+/* Writes "cs230 STATUS <left> <op> <right>\n"; false when it does not fit. */
+static bool format_status(const MathProblem *problem, char *line, size_t capacity) {
+    int written = snprintf(line, capacity, "%s%lld %c %lld\n", STATUS_PREFIX,
+                           problem->left, problem->operation, problem->right);
+    return written > 0 && (size_t)written < capacity;
+}
+
+/* True when line is byte-exactly "cs230 <answer>" for the problem. */
+static bool is_correct_answer(const MathProblem *problem, const char *line) {
+    char expected[MAX_LINE_LENGTH];
+    int written = snprintf(expected, sizeof expected, "%s%lld", PROTOCOL_PREFIX, evaluate(problem));
+    return written > 0 && (size_t)written < sizeof expected && strcmp(expected, line) == 0;
+}
+
+/* Writes "cs230 <flag> BYE\n"; false when it does not fit. */
+static bool format_bye(const char *flag, char *line, size_t capacity) {
+    int written = snprintf(line, capacity, "%s%s%s\n", PROTOCOL_PREFIX, flag, BYE_SUFFIX);
+    return written > 0 && (size_t)written < capacity;
 }
