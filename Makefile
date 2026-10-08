@@ -1,5 +1,6 @@
 # Build driver for the Math Bot client. Section numbers refer to docs/conventions.md.
-# The submitted deliverable is src/client.c alone; everything here exists to prove it.
+# The submitted deliverable is src/client.c alone; everything here exists to prove it,
+# including server/mathbot_server.c, the local stand-in for the course server (docs/server.md).
 
 # make predefines CC=cc, so ?= would never apply; = still lets `make CC=clang` override.
 CC = gcc
@@ -22,13 +23,19 @@ OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 DEBUG_OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(BUILD)/debug/%.o,$(SOURCES))
 BIN = $(BUILD)/client
 DEBUG_BIN = $(BUILD)/debug/client
+# The server is built from its own directory with the client's flags; it is never submitted.
+SERVER_DIR = server
+SERVER_SOURCES = $(wildcard $(SERVER_DIR)/*.c)
+SERVER_OBJECTS = $(patsubst $(SERVER_DIR)/%.c,$(BUILD)/%.o,$(SERVER_SOURCES))
+SERVER_BIN = $(BUILD)/mathbot_server
 
-# Defaults for `make run`, the course server; override on the command line: make run ID=me@umass.edu
+# Defaults for `make run` and `make server-run`: the local server on the course's port.
+# The course server (128.119.243.147) is gone; override on the command line: make run ID=me@umass.edu
 ID ?= netid@umass.edu
 PORT ?= 27993
-HOST ?= 128.119.243.147
+HOST ?= 127.0.0.1
 
-.PHONY: all debug test check run dist clean
+.PHONY: all debug test check run dist clean server server-run
 
 # all: release binary into build/ (section 3).
 all: $(BIN)
@@ -38,6 +45,19 @@ $(BIN): $(OBJECTS)
 
 $(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# server: the local math-speak server into build/ (same flags, same rules, own source directory).
+server: $(SERVER_BIN)
+
+$(SERVER_BIN): $(SERVER_OBJECTS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD)/%.o: $(SERVER_DIR)/%.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# server-run: serve on PORT (default 27993) until Ctrl-C; the client then targets 127.0.0.1.
+server-run: $(SERVER_BIN)
+	$(SERVER_BIN) $(PORT)
 
 # debug: -O0 -g3 binary into build/debug/ so it never shadows the release objects.
 debug: $(DEBUG_BIN)
@@ -51,15 +71,17 @@ $(BUILD)/debug/%.o: $(SRC_DIR)/%.c | $(BUILD)/debug
 $(BUILD) $(BUILD)/debug $(BUILD)/check:
 	mkdir -p $@
 
-# test: run_tests.sh compiles the unit tests with the same flags and hands the binary to the e2e scripts.
-test: $(BIN)
-	CC="$(CC)" CFLAGS="$(CFLAGS)" CLIENT_BIN="$(abspath $(BIN))" bash test/run_tests.sh
+# test: run_tests.sh compiles the unit tests with the same flags and hands both binaries to the e2e scripts.
+test: $(BIN) $(SERVER_BIN)
+	CC="$(CC)" CFLAGS="$(CFLAGS)" CLIENT_BIN="$(abspath $(BIN))" SERVER_BIN="$(abspath $(SERVER_BIN))" \
+		bash test/run_tests.sh
 
-# check: -fanalyzer needs a real compile, so the object lands in build/check and is never linked.
+# check: -fanalyzer needs a real compile, so the objects land in build/check and are never linked.
 check: | $(BUILD)/check
 	$(CC) $(CFLAGS) -fanalyzer -c $(SOURCES) -o $(BUILD)/check/client.o
+	$(CC) $(CFLAGS) -fanalyzer -c $(SERVER_SOURCES) -o $(BUILD)/check/mathbot_server.o
 
-# run: the course server with a placeholder NetID; pass ID=... to use yours.
+# run: the client against HOST:PORT (default: a local server) with a placeholder NetID; pass ID=... to use yours.
 run: $(BIN)
 	$(BIN) $(ID) $(PORT) $(HOST)
 
@@ -76,4 +98,4 @@ dist:
 clean:
 	rm -rf $(BUILD) $(DIST)
 
--include $(OBJECTS:.o=.d) $(DEBUG_OBJECTS:.o=.d)
+-include $(OBJECTS:.o=.d) $(DEBUG_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d)

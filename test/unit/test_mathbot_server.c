@@ -13,7 +13,10 @@ int server_main(int argc, char **argv);
 static const char *sha256_hex_of(const unsigned char *data, size_t count) {
     static char hex[SHA256_HEX_LENGTH + 1];
     unsigned char digest[SHA256_DIGEST_LENGTH];
-    sha256_digest(data, count, digest);
+    Sha256 hash;
+    sha256_init(&hash);
+    sha256_update(&hash, data, count);
+    sha256_final(&hash, digest);
     hex_encode(digest, sizeof digest, hex);
     return hex;
 }
@@ -228,6 +231,154 @@ static void test_format_lines(void) {
     CHECK(!format_bye("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", line, too_small_for_bye));
 }
 
+static void test_parse_port(void) {
+    unsigned short port = 1;
+    CHECK(parse_port("27993", &port));
+    CHECK_EQ_INT(port, 27993);
+    CHECK(parse_port("0", &port) && port == 0);
+    CHECK(parse_port("65535", &port) && port == 65535);
+    CHECK(!parse_port("65536", &port));
+    CHECK(!parse_port("-1", &port));
+    CHECK(!parse_port("+1", &port));
+    CHECK(!parse_port("80x", &port));
+    CHECK(!parse_port(" 80", &port));
+    CHECK(!parse_port("", &port));
+    CHECK(!parse_port("99999999999999999999", &port));
+}
+
+static void test_parse_problem_override(void) {
+    long count = 0;
+    CHECK(parse_problem_override("400", &count));
+    CHECK_EQ_INT(count, 400);
+    CHECK(parse_problem_override("1", &count) && count == 1);
+    CHECK(parse_problem_override("100000", &count) && count == MAX_PROBLEM_OVERRIDE);
+    CHECK(!parse_problem_override("0", &count));
+    CHECK(!parse_problem_override("100001", &count));
+    CHECK(!parse_problem_override("-5", &count));
+    CHECK(!parse_problem_override("4e2", &count));
+    CHECK(!parse_problem_override("", &count));
+}
+
+/* Sets or clears an environment variable, failing the test on error. */
+static void set_variable(const char *name, const char *value) {
+    if (value == NULL) {
+        CHECK(unsetenv(name) == 0);
+    } else {
+        CHECK(setenv(name, value, 1) == 0);
+    }
+}
+
+/* Argument beats MATHBOT_PORT beats the default; MATHBOT_PROBLEMS and MATHBOT_SECRET are read once. */
+static void test_load_config(void) {
+    ServerConfig config;
+    char *no_port[] = { "mathbot_server", NULL };
+    char *with_port[] = { "mathbot_server", "4242", NULL };
+    char *bad_port[] = { "mathbot_server", "99999", NULL };
+    char *too_many[] = { "mathbot_server", "1", "2", NULL };
+    set_variable(PORT_VARIABLE, NULL);
+    set_variable(PROBLEMS_VARIABLE, NULL);
+    set_variable(SECRET_VARIABLE, NULL);
+    CHECK(load_config(1, no_port, &config));
+    CHECK_EQ_INT(config.port, DEFAULT_PORT);
+    CHECK_EQ_INT(config.problem_override, 0);
+    CHECK_EQ_STR(config.secret, "");
+    set_variable(PORT_VARIABLE, "5555");
+    set_variable(PROBLEMS_VARIABLE, "400");
+    set_variable(SECRET_VARIABLE, "s3cret");
+    CHECK(load_config(1, no_port, &config));
+    CHECK_EQ_INT(config.port, 5555);
+    CHECK_EQ_INT(config.problem_override, 400);
+    CHECK_EQ_STR(config.secret, "s3cret");
+    CHECK(load_config(2, with_port, &config));
+    CHECK_EQ_INT(config.port, 4242);
+    CHECK(!load_config(2, bad_port, &config));
+    CHECK(!load_config(3, too_many, &config));
+    set_variable(PORT_VARIABLE, "abc");
+    CHECK(!load_config(1, no_port, &config));
+    set_variable(PORT_VARIABLE, "");
+    set_variable(PROBLEMS_VARIABLE, "0");
+    CHECK(!load_config(1, no_port, &config));
+    set_variable(PROBLEMS_VARIABLE, NULL);
+    CHECK(load_config(1, no_port, &config));
+    CHECK_EQ_INT(config.port, DEFAULT_PORT);
+    set_variable(PORT_VARIABLE, NULL);
+    set_variable(SECRET_VARIABLE, NULL);
+}
+
+/* Writes all of text to a descriptor, failing the test on a short write. */
+static void write_text(int fd, const char *text) {
+    CHECK(write(fd, text, strlen(text)) == (ssize_t)strlen(text));
+}
+
+/* Lines arrive whole whether the peer split them, coalesced them, or stopped early. */
+static void test_receive_line_frames_across_boundaries(void) {
+    int pair[2];
+    LineBuffer buffer = { {0}, 0 };
+    char line[RECEIVE_BUFFER_SIZE];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    write_text(pair[1], "cs230 HEL");
+    write_text(pair[1], "LO jdoe@umass.edu\ncs230 66\ncs2");
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_LINE);
+    CHECK_EQ_STR(line, "cs230 HELLO jdoe@umass.edu");
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_LINE);
+    CHECK_EQ_STR(line, "cs230 66");
+    write_text(pair[1], "30 -3\r\n");
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_LINE);
+    CHECK_EQ_STR(line, "cs230 -3\r");
+    write_text(pair[1], "partial");
+    CHECK(close(pair[1]) == 0);
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_EOF);
+    CHECK(close(pair[0]) == 0);
+}
+
+/* A line that never ends is a protocol error once the buffer is full, not a hang. */
+static void test_receive_line_rejects_overlong_line(void) {
+    int pair[2];
+    LineBuffer buffer = { {0}, 0 };
+    char line[RECEIVE_BUFFER_SIZE];
+    char filler[RECEIVE_BUFFER_SIZE + 1];
+    memset(filler, 'x', sizeof filler);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    CHECK(write(pair[1], filler, sizeof filler) == (ssize_t)sizeof filler);
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_ERROR);
+    CHECK(close(pair[1]) == 0);
+    CHECK(close(pair[0]) == 0);
+}
+
+/* With SO_RCVTIMEO set, a silent peer yields RECEIVE_TIMEOUT instead of blocking forever. */
+static void test_receive_line_times_out(void) {
+    int pair[2];
+    LineBuffer buffer = { {0}, 0 };
+    char line[RECEIVE_BUFFER_SIZE];
+    struct timeval timeout = { 0, 50000 };
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    CHECK(set_receive_timeout(pair[0], timeout));
+    write_text(pair[1], "no newline yet");
+    CHECK_EQ_INT(receive_line(pair[0], &buffer, line, sizeof line), RECEIVE_TIMEOUT);
+    CHECK(close(pair[1]) == 0);
+    CHECK(close(pair[0]) == 0);
+}
+
+static void test_describe_outcome(void) {
+    CHECK_EQ_STR(describe_outcome(SESSION_FLAG_SENT), "flag sent");
+    CHECK_EQ_STR(describe_outcome(SESSION_BAD_HELLO), "closed: bad HELLO");
+    CHECK_EQ_STR(describe_outcome(SESSION_WRONG_ANSWER), "closed: wrong answer");
+    CHECK_EQ_STR(describe_outcome(SESSION_CLIENT_LEFT), "closed: client hung up");
+    CHECK_EQ_STR(describe_outcome(SESSION_TIMED_OUT), "closed: timed out");
+    CHECK_EQ_STR(describe_outcome(SESSION_FAILED), "closed: socket error");
+}
+
+/* The override wins; otherwise the count is the seeded random one in range. */
+static void test_session_problem_count(void) {
+    ServerConfig config = { 0, 400, "" };
+    uint32_t state = 7;
+    long count;
+    CHECK_EQ_INT(session_problem_count(&config, &state), 400);
+    config.problem_override = 0;
+    count = session_problem_count(&config, &state);
+    CHECK(count >= PROBLEMS_MIN && count <= PROBLEMS_MAX);
+}
+
 int main(void) {
     test_sha256_standard_vectors();
     test_sha256_padding_boundaries();
@@ -241,5 +392,13 @@ int main(void) {
     test_parse_hello();
     test_is_correct_answer();
     test_format_lines();
+    test_parse_port();
+    test_parse_problem_override();
+    test_load_config();
+    test_receive_line_frames_across_boundaries();
+    test_receive_line_rejects_overlong_line();
+    test_receive_line_times_out();
+    test_describe_outcome();
+    test_session_problem_count();
     CHECK_REPORT("test_mathbot_server");
 }

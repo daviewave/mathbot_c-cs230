@@ -3,14 +3,33 @@
  * problems and ends a fully correct session with a SHA-256 flag. Design notes
  * live in docs/server.md. */
 
+#include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 enum {
+    DEFAULT_PORT = 27993,
+    MAX_PORT = 65535,
+    MAX_ARGUMENT_COUNT = 2,
+    LISTEN_BACKLOG = 16,
+    RECEIVE_BUFFER_SIZE = 4096,
+    SESSION_TIMEOUT_SECONDS = 30,
+    ACCEPT_POLL_SECONDS = 1,
+    MAX_PROBLEM_OVERRIDE = 100000,
+    PEER_TEXT_CAPACITY = INET_ADDRSTRLEN + 6,
     PROBLEMS_MIN = 300,
     PROBLEMS_MAX = 2000,
     OPERAND_MIN = -1000,
@@ -26,6 +45,9 @@ enum {
     FLAG_LENGTH = SHA256_HEX_LENGTH
 };
 
+#define PORT_VARIABLE "MATHBOT_PORT"
+#define PROBLEMS_VARIABLE "MATHBOT_PROBLEMS"
+#define SECRET_VARIABLE "MATHBOT_SECRET"
 #define OPERATORS "+-*/"
 #define IDENTIFICATION_DOMAIN "@umass.edu"
 #define PROTOCOL_PREFIX "cs230 "
@@ -33,12 +55,47 @@ enum {
 #define STATUS_PREFIX "cs230 STATUS "
 #define BYE_SUFFIX " BYE"
 
+/* Settings read once at startup and handed to every session; never global. */
+typedef struct {
+    unsigned short port;
+    long problem_override;
+    const char *secret;
+} ServerConfig;
+
 /* One arithmetic problem: left <operation> right. */
 typedef struct {
     long long left;
     char operation;
     long long right;
 } MathProblem;
+
+/* Bytes received from the client that have not been consumed as whole lines yet. */
+typedef struct {
+    char data[RECEIVE_BUFFER_SIZE];
+    size_t used;
+} LineBuffer;
+
+/* Outcome of waiting for one line. */
+typedef enum {
+    RECEIVE_LINE,
+    RECEIVE_EOF,
+    RECEIVE_TIMEOUT,
+    RECEIVE_ERROR
+} ReceiveResult;
+
+/* How a session step ended; everything but SESSION_OK stops the session. */
+typedef enum {
+    SESSION_OK,
+    SESSION_FLAG_SENT,
+    SESSION_BAD_HELLO,
+    SESSION_WRONG_ANSWER,
+    SESSION_CLIENT_LEFT,
+    SESSION_TIMED_OUT,
+    SESSION_FAILED
+} SessionOutcome;
+
+/* The only global: set by the SIGINT/SIGTERM handler, polled by the accept loop. */
+static volatile sig_atomic_t shutdown_requested = 0;
 
 /* SHA-256 running state: the eight hash words, bytes seen, and the partial block. */
 typedef struct {
@@ -203,14 +260,6 @@ static void sha256_final(Sha256 *hash, unsigned char *digest) {
     }
 }
 
-/* One-shot SHA-256 of count bytes into digest (SHA256_DIGEST_LENGTH bytes). */
-static void sha256_digest(const unsigned char *data, size_t count, unsigned char *digest) {
-    Sha256 hash;
-    sha256_init(&hash);
-    sha256_update(&hash, data, count);
-    sha256_final(&hash, digest);
-}
-
 /* Writes count bytes as 2*count lowercase hex digits plus a terminator into hex. */
 static void hex_encode(const unsigned char *bytes, size_t count, char *hex) {
     static const char digits[] = "0123456789abcdef";
@@ -346,4 +395,506 @@ static bool is_correct_answer(const MathProblem *problem, const char *line) {
 static bool format_bye(const char *flag, char *line, size_t capacity) {
     int written = snprintf(line, capacity, "%s%s%s\n", PROTOCOL_PREFIX, flag, BYE_SUFFIX);
     return written > 0 && (size_t)written < capacity;
+}
+
+/* ---- Configuration ------------------------------------------------------ */
+
+/* Prints the command-line usage on stderr. */
+static void print_usage(const char *program) {
+    fprintf(stderr, "usage: %s [PORT]   (default: $%s, then %d)\n", program, PORT_VARIABLE, DEFAULT_PORT);
+}
+
+/* Parses an unsigned decimal in 0..maximum; rejects signs, whitespace and trailing text. */
+static bool parse_bounded_decimal(const char *text, long maximum, long *value) {
+    char *end;
+    if (!isdigit((unsigned char)text[0])) {
+        return false;
+    }
+    errno = 0;
+    *value = strtol(text, &end, 10);
+    return errno == 0 && *end == '\0' && *value <= maximum;
+}
+
+/* Parses a port in 0..65535; 0 asks the kernel for an ephemeral port. */
+static bool parse_port(const char *text, unsigned short *port) {
+    long value;
+    if (!parse_bounded_decimal(text, MAX_PORT, &value)) {
+        return false;
+    }
+    *port = (unsigned short)value;
+    return true;
+}
+
+/* Parses the MATHBOT_PROBLEMS override in 1..MAX_PROBLEM_OVERRIDE. */
+static bool parse_problem_override(const char *text, long *count) {
+    return parse_bounded_decimal(text, MAX_PROBLEM_OVERRIDE, count) && *count >= 1;
+}
+
+/* The environment variable's value, or NULL when it is unset or empty. */
+static const char *variable_or_null(const char *name) {
+    const char *value = getenv(name);
+    return value != NULL && value[0] != '\0' ? value : NULL;
+}
+
+/* Chooses the port: the argument, else MATHBOT_PORT, else DEFAULT_PORT; reports bad text. */
+static bool load_port(int argc, char **argv, unsigned short *port) {
+    const char *text = argc > 1 ? argv[1] : variable_or_null(PORT_VARIABLE);
+    if (text == NULL) {
+        *port = DEFAULT_PORT;
+        return true;
+    }
+    if (!parse_port(text, port)) {
+        fprintf(stderr, "invalid port '%s': expected 0..%d\n", text, MAX_PORT);
+        return false;
+    }
+    return true;
+}
+
+/* Reads MATHBOT_PROBLEMS into the override, 0 when unset; reports bad text. */
+static bool load_problem_override(long *override) {
+    const char *text = variable_or_null(PROBLEMS_VARIABLE);
+    if (text == NULL) {
+        *override = 0;
+        return true;
+    }
+    if (!parse_problem_override(text, override)) {
+        fprintf(stderr, "invalid %s '%s': expected 1..%d\n", PROBLEMS_VARIABLE, text, MAX_PROBLEM_OVERRIDE);
+        return false;
+    }
+    return true;
+}
+
+/* Validates argv and the environment into config; false after reporting the reason. */
+static bool load_config(int argc, char **argv, ServerConfig *config) {
+    const char *secret;
+    if (argc > MAX_ARGUMENT_COUNT) {
+        fprintf(stderr, "expected at most 1 argument, got %d\n", argc - 1);
+        return false;
+    }
+    if (!load_port(argc, argv, &config->port) || !load_problem_override(&config->problem_override)) {
+        return false;
+    }
+    secret = getenv(SECRET_VARIABLE);
+    config->secret = secret != NULL ? secret : "";
+    return true;
+}
+
+/* ---- Signals -------------------------------------------------------------- */
+
+/* SIGCHLD handler: reaps every finished child without blocking; keeps errno intact. */
+static void reap_children(int signum) {
+    int saved_errno = errno;
+    (void)signum;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
+    errno = saved_errno;
+}
+
+/* SIGINT/SIGTERM handler: asks the accept loop to stop. */
+static void request_shutdown(int signum) {
+    (void)signum;
+    shutdown_requested = 1;
+}
+
+/* Installs handler for signum with the given sigaction flags; reports failure. */
+static bool install_handler(int signum, void (*handler)(int), int flags) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = handler;
+    action.sa_flags = flags;
+    if (sigemptyset(&action.sa_mask) != 0 || sigaction(signum, &action, NULL) != 0) {
+        fprintf(stderr, "sigaction(%d): %s\n", signum, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Parent process signals: reap children, stop on INT/TERM, survive a peer's early close. */
+static bool install_signal_handlers(void) {
+    return install_handler(SIGCHLD, reap_children, SA_RESTART | SA_NOCLDSTOP) &&
+           install_handler(SIGINT, request_shutdown, 0) &&
+           install_handler(SIGTERM, request_shutdown, 0) &&
+           install_handler(SIGPIPE, SIG_IGN, 0);
+}
+
+/* Child process signals: INT/TERM kill the session again; SIGPIPE stays ignored. */
+static bool restore_default_signals(void) {
+    return install_handler(SIGCHLD, SIG_DFL, 0) &&
+           install_handler(SIGINT, SIG_DFL, 0) &&
+           install_handler(SIGTERM, SIG_DFL, 0);
+}
+
+/* ---- Sockets ------------------------------------------------------------ */
+
+/* Closes a socket, reporting (but not otherwise handling) a failure. */
+static bool close_socket(int socket_fd) {
+    if (close(socket_fd) != 0) {
+        fprintf(stderr, "close: %s\n", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Sets SO_RCVTIMEO so recv (and accept, on Linux) gives up after timeout. */
+static bool set_receive_timeout(int socket_fd, struct timeval timeout) {
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) != 0) {
+        fprintf(stderr, "setsockopt(SO_RCVTIMEO): %s\n", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Allows an immediate restart while old connections linger in TIME_WAIT. */
+static bool allow_address_reuse(int socket_fd) {
+    int enabled = 1;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof enabled) != 0) {
+        fprintf(stderr, "setsockopt(SO_REUSEADDR): %s\n", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Binds to 0.0.0.0:port so the server is reachable inside a container too. */
+static bool bind_any_address(int socket_fd, unsigned short port) {
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof address);
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(socket_fd, (struct sockaddr *)&address, sizeof address) != 0) {
+        fprintf(stderr, "bind to port %u: %s\n", (unsigned int)port, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* Opens the listening socket; returns the descriptor or -1 after reporting. */
+static int open_listener(unsigned short port) {
+    struct timeval accept_poll = { ACCEPT_POLL_SECONDS, 0 };
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) {
+        fprintf(stderr, "socket: %s\n", strerror(errno));
+        return -1;
+    }
+    if (!allow_address_reuse(listener) || !bind_any_address(listener, port) ||
+        !set_receive_timeout(listener, accept_poll)) {
+        (void)close_socket(listener);
+        return -1;
+    }
+    if (listen(listener, LISTEN_BACKLOG) != 0) {
+        fprintf(stderr, "listen: %s\n", strerror(errno));
+        (void)close_socket(listener);
+        return -1;
+    }
+    return listener;
+}
+
+/* The port the listener actually got, which matters when 0 was requested. */
+static bool bound_port(int listener, unsigned short *port) {
+    struct sockaddr_in address;
+    socklen_t length = sizeof address;
+    if (getsockname(listener, (struct sockaddr *)&address, &length) != 0) {
+        fprintf(stderr, "getsockname: %s\n", strerror(errno));
+        return false;
+    }
+    *port = ntohs(address.sin_port);
+    return true;
+}
+
+/* Formats a peer as "a.b.c.d:port" for the log. */
+static void format_peer(const struct sockaddr_in *address, char *text, size_t capacity) {
+    char host[INET_ADDRSTRLEN] = "?";
+    (void)inet_ntop(AF_INET, &address->sin_addr, host, sizeof host);
+    (void)snprintf(text, capacity, "%s:%u", host, (unsigned int)ntohs(address->sin_port));
+}
+
+/* Writes one log line to stdout and flushes it so forked children never duplicate it. */
+static void log_line(const char *message) {
+    printf("%s\n", message);
+    (void)fflush(stdout);
+}
+
+/* Writes one per-session log line: "<peer> <message>". */
+static void log_session(const char *peer, const char *message) {
+    printf("%s %s\n", peer, message);
+    (void)fflush(stdout);
+}
+
+/* Appends received bytes to the buffer; false when they do not fit. */
+static bool line_buffer_append(LineBuffer *buffer, const char *bytes, size_t count) {
+    if (count > sizeof buffer->data - buffer->used) {
+        return false;
+    }
+    memcpy(buffer->data + buffer->used, bytes, count);
+    buffer->used += count;
+    return true;
+}
+
+/* Copies the first complete line (without its newline) into line and removes it
+ * from the buffer; false when no complete line is buffered or it exceeds capacity. */
+static bool line_buffer_take_line(LineBuffer *buffer, char *line, size_t capacity) {
+    const char *newline = memchr(buffer->data, '\n', buffer->used);
+    size_t length;
+    if (newline == NULL) {
+        return false;
+    }
+    length = (size_t)(newline - buffer->data);
+    if (length >= capacity) {
+        return false;
+    }
+    memcpy(line, buffer->data, length);
+    line[length] = '\0';
+    buffer->used -= length + 1;
+    memmove(buffer->data, buffer->data + length + 1, buffer->used);
+    return true;
+}
+
+/* Classifies a failed recv: a timeout, or an error worth reporting. */
+static ReceiveResult classify_receive_failure(void) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return RECEIVE_TIMEOUT;
+    }
+    fprintf(stderr, "recv: %s\n", strerror(errno));
+    return RECEIVE_ERROR;
+}
+
+/* Reads from the socket until one complete line is available in line. */
+static ReceiveResult receive_line(int socket_fd, LineBuffer *buffer, char *line, size_t capacity) {
+    while (!line_buffer_take_line(buffer, line, capacity)) {
+        char chunk[RECEIVE_BUFFER_SIZE];
+        ssize_t received = recv(socket_fd, chunk, sizeof chunk, 0);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received < 0) {
+            return classify_receive_failure();
+        }
+        if (received == 0) {
+            return RECEIVE_EOF;
+        }
+        if (!line_buffer_append(buffer, chunk, (size_t)received)) {
+            fprintf(stderr, "protocol error: line longer than %d bytes\n", RECEIVE_BUFFER_SIZE);
+            return RECEIVE_ERROR;
+        }
+    }
+    return RECEIVE_LINE;
+}
+
+/* Sends every byte, looping because a stream send may write fewer bytes than asked. */
+static bool send_all(int socket_fd, const char *bytes, size_t count) {
+    size_t sent_total = 0;
+    while (sent_total < count) {
+        ssize_t sent = send(socket_fd, bytes + sent_total, count - sent_total, 0);
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0) {
+            fprintf(stderr, "send: %s\n", strerror(errno));
+            return false;
+        }
+        sent_total += (size_t)sent;
+    }
+    return true;
+}
+
+/* ---- One session (runs in the forked child) ----------------------------- */
+
+/* Maps a receive failure onto the session outcome it ends with. */
+static SessionOutcome outcome_of_receive(ReceiveResult result) {
+    switch (result) {
+    case RECEIVE_EOF:
+        return SESSION_CLIENT_LEFT;
+    case RECEIVE_TIMEOUT:
+        return SESSION_TIMED_OUT;
+    default:
+        return SESSION_FAILED;
+    }
+}
+
+/* The log text for an outcome. */
+static const char *describe_outcome(SessionOutcome outcome) {
+    switch (outcome) {
+    case SESSION_FLAG_SENT:
+        return "flag sent";
+    case SESSION_BAD_HELLO:
+        return "closed: bad HELLO";
+    case SESSION_WRONG_ANSWER:
+        return "closed: wrong answer";
+    case SESSION_CLIENT_LEFT:
+        return "closed: client hung up";
+    case SESSION_TIMED_OUT:
+        return "closed: timed out";
+    default:
+        return "closed: socket error";
+    }
+}
+
+/* A per-connection seed: wall-clock time mixed with the child's pid. */
+static uint32_t session_seed(void) {
+    return (uint32_t)time(NULL) * 2654435761u ^ (uint32_t)getpid();
+}
+
+/* The override from MATHBOT_PROBLEMS when set, else the spec's random count. */
+static long session_problem_count(const ServerConfig *config, uint32_t *state) {
+    return config->problem_override > 0 ? config->problem_override : problem_count(state);
+}
+
+/* Requires the first line to be a valid HELLO and keeps its identification. */
+static SessionOutcome receive_hello(int connection, LineBuffer *buffer, char *identification, size_t capacity) {
+    char line[RECEIVE_BUFFER_SIZE];
+    ReceiveResult result = receive_line(connection, buffer, line, sizeof line);
+    if (result != RECEIVE_LINE) {
+        return outcome_of_receive(result);
+    }
+    return parse_hello(line, identification, capacity) ? SESSION_OK : SESSION_BAD_HELLO;
+}
+
+/* Sends one STATUS line and requires the byte-exact answer. */
+static SessionOutcome ask_problem(int connection, LineBuffer *buffer, const MathProblem *problem) {
+    char line[RECEIVE_BUFFER_SIZE];
+    ReceiveResult result;
+    if (!format_status(problem, line, sizeof line) || !send_all(connection, line, strlen(line))) {
+        return SESSION_FAILED;
+    }
+    result = receive_line(connection, buffer, line, sizeof line);
+    if (result != RECEIVE_LINE) {
+        return outcome_of_receive(result);
+    }
+    return is_correct_answer(problem, line) ? SESSION_OK : SESSION_WRONG_ANSWER;
+}
+
+/* Asks count problems in turn, stopping at the first one not answered correctly. */
+static SessionOutcome ask_problems(int connection, LineBuffer *buffer, uint32_t *state, long count) {
+    long asked;
+    for (asked = 0; asked < count; asked++) {
+        MathProblem problem = make_problem(state);
+        SessionOutcome outcome = ask_problem(connection, buffer, &problem);
+        if (outcome != SESSION_OK) {
+            return outcome;
+        }
+    }
+    return SESSION_OK;
+}
+
+/* Sends "cs230 <flag> BYE\n" for the identification. */
+static SessionOutcome send_bye(int connection, const char *secret, const char *identification) {
+    char flag[FLAG_LENGTH + 1];
+    char line[RECEIVE_BUFFER_SIZE];
+    derive_flag(secret, identification, flag);
+    if (!format_bye(flag, line, sizeof line) || !send_all(connection, line, strlen(line))) {
+        return SESSION_FAILED;
+    }
+    return SESSION_FLAG_SENT;
+}
+
+/* One math-speak session from HELLO to BYE; returns why it ended. */
+static SessionOutcome run_session(int connection, const ServerConfig *config) {
+    LineBuffer buffer = { {0}, 0 };
+    char identification[MAX_LINE_LENGTH];
+    uint32_t state = session_seed();
+    long count = session_problem_count(config, &state);
+    SessionOutcome outcome = receive_hello(connection, &buffer, identification, sizeof identification);
+    if (outcome == SESSION_OK) {
+        outcome = ask_problems(connection, &buffer, &state, count);
+    }
+    if (outcome == SESSION_OK) {
+        outcome = send_bye(connection, config->secret, identification);
+    }
+    return outcome;
+}
+
+/* Logs the connection, runs the session under the recv timeout, logs the outcome. */
+static void serve_connection(int connection, const ServerConfig *config, const char *peer) {
+    struct timeval timeout = { SESSION_TIMEOUT_SECONDS, 0 };
+    SessionOutcome outcome = SESSION_FAILED;
+    log_session(peer, "connected");
+    if (set_receive_timeout(connection, timeout)) {
+        outcome = run_session(connection, config);
+    }
+    log_session(peer, describe_outcome(outcome));
+}
+
+/* The child's whole life: drop the listener, serve, close, exit. */
+static void run_child(int listener, int connection, const ServerConfig *config, const char *peer) {
+    (void)close_socket(listener);
+    (void)restore_default_signals();
+    serve_connection(connection, config, peer);
+    (void)close_socket(connection);
+    exit(EXIT_SUCCESS);
+}
+
+/* ---- Accept loop (the parent) ------------------------------------------- */
+
+/* Forks a child for the accepted connection; the parent keeps only the listener. */
+static void spawn_session(int listener, int connection, const ServerConfig *config,
+                          const struct sockaddr_in *peer_address) {
+    char peer[PEER_TEXT_CAPACITY];
+    pid_t child;
+    format_peer(peer_address, peer, sizeof peer);
+    child = fork();
+    if (child < 0) {
+        fprintf(stderr, "fork: %s\n", strerror(errno));
+        log_session(peer, "rejected: fork failed");
+    } else if (child == 0) {
+        run_child(listener, connection, config, peer);
+    }
+    (void)close_socket(connection);
+}
+
+/* True for accept failures that mean "try again": the poll timeout, a signal, an aborted peer. */
+static bool is_transient_accept_failure(int error) {
+    return error == EAGAIN || error == EWOULDBLOCK || error == EINTR || error == ECONNABORTED;
+}
+
+/* Accepts connections until SIGINT/SIGTERM; returns the exit status. */
+static int accept_forever(int listener, const ServerConfig *config) {
+    while (!shutdown_requested) {
+        struct sockaddr_in peer_address;
+        socklen_t length = sizeof peer_address;
+        int connection = accept(listener, (struct sockaddr *)&peer_address, &length);
+        if (connection >= 0) {
+            spawn_session(listener, connection, config, &peer_address);
+        } else if (!is_transient_accept_failure(errno)) {
+            fprintf(stderr, "accept: %s\n", strerror(errno));
+            return EXIT_FAILURE;
+        }
+    }
+    log_line("shutting down");
+    return EXIT_SUCCESS;
+}
+
+/* Announces the bound port as the first stdout line, so a script can read it. */
+static bool announce_listening(int listener) {
+    unsigned short port;
+    char message[MAX_LINE_LENGTH];
+    if (!bound_port(listener, &port)) {
+        return false;
+    }
+    (void)snprintf(message, sizeof message, "listening on port %u", (unsigned int)port);
+    log_line(message);
+    return true;
+}
+
+/* Entry point: configure, install handlers, listen, announce, accept until told to stop. */
+int main(int argc, char **argv) {
+    const char *program = argc > 0 ? argv[0] : "mathbot_server";
+    ServerConfig config;
+    int listener;
+    int status;
+    if (!load_config(argc, argv, &config)) {
+        print_usage(program);
+        return EXIT_FAILURE;
+    }
+    if (!install_signal_handlers()) {
+        return EXIT_FAILURE;
+    }
+    listener = open_listener(config.port);
+    if (listener < 0) {
+        return EXIT_FAILURE;
+    }
+    status = announce_listening(listener) ? accept_forever(listener, &config) : EXIT_FAILURE;
+    if (!close_socket(listener)) {
+        status = EXIT_FAILURE;
+    }
+    return status;
 }
