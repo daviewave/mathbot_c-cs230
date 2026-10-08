@@ -34,8 +34,10 @@ SERVER_BIN = $(BUILD)/mathbot_server
 ID ?= netid@umass.edu
 PORT ?= 27993
 HOST ?= 127.0.0.1
+# The identification `make autograde` grades with; any NetID@umass.edu works since the flag derives from it.
+AUTOGRADE_ID ?= autograde@umass.edu
 
-.PHONY: all debug test check run dist clean server server-run
+.PHONY: all debug test check run dist clean server server-run autograde
 
 # all: release binary into build/ (section 3).
 all: $(BIN)
@@ -94,6 +96,11 @@ dist:
 	$(MAKE) -C $(DIST)
 	cd $(DIST) && $(CC) -std=c99 -Wall client.c -o a.out && rm -f a.out
 	cd $(DIST) && $(CC) client.c && rm -f a.out
+
+# autograde: what Gradescope did (docs/server.md): the dist bundle compiled with a plain `gcc client.c -o a.out`,
+# run against the local server with AUTOGRADE_ID, stdout compared with the flag python computes. PASS/FAIL, exit status.
+autograde: dist $(SERVER_BIN)
+	DIST="$(abspath $(DIST))" SERVER_BIN="$(abspath $(SERVER_BIN))" AUTOGRADE_ID="$(AUTOGRADE_ID)" bash test/autograde.sh
 
 clean:
 	rm -rf $(BUILD) $(DIST)
