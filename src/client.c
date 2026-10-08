@@ -58,11 +58,11 @@ typedef enum {
     RECEIVE_ERROR
 } ReceiveResult;
 
-enum {
+typedef enum {
     SESSION_CONTINUE,
     SESSION_DONE,
     SESSION_FAILED
-};
+} SessionOutcome;
 
 /* Prints the command-line usage on stderr. */
 static void print_usage(const char *program) {
@@ -251,12 +251,12 @@ static int connect_to_server(const char *host, unsigned short port) {
     address.sin_port = htons(port);
     if (inet_pton(AF_INET, host, &address.sin_addr) != 1) {
         fprintf(stderr, "invalid host '%s'\n", host);
-        close_socket(socket_fd);
+        (void)close_socket(socket_fd);
         return -1;
     }
     if (connect(socket_fd, (struct sockaddr *)&address, sizeof address) != 0) {
         fprintf(stderr, "connect to %s:%u: %s\n", host, (unsigned int)port, strerror(errno));
-        close_socket(socket_fd);
+        (void)close_socket(socket_fd);
         return -1;
     }
     return socket_fd;
@@ -423,7 +423,7 @@ static bool print_flag(const char *flag) {
 }
 
 /* Answers a STATUS line, prints the flag of a BYE line, or reports anything else. */
-static int handle_line(int socket_fd, const char *line, bool verbose) {
+static SessionOutcome handle_line(int socket_fd, const char *line, bool verbose) {
     MathProblem problem;
     char flag[FLAG_CAPACITY];
     if (parse_status(line, &problem)) {
@@ -440,7 +440,7 @@ static int handle_line(int socket_fd, const char *line, bool verbose) {
 static int run_session(int socket_fd, const char *identification, bool verbose) {
     LineBuffer buffer = { {0}, 0 };
     char line[RECEIVE_BUFFER_SIZE];
-    int outcome = SESSION_CONTINUE;
+    SessionOutcome outcome = SESSION_CONTINUE;
     if (!send_hello(socket_fd, identification, verbose)) {
         return EXIT_FAILURE;
     }
