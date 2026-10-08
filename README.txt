@@ -20,21 +20,30 @@ Build and run
 -------------
     make                 release build into build/client
     make debug           -O0 -g3 build into build/debug/client
-    make check           gcc -fanalyzer over src/
-    make test            unit tests plus end-to-end tests against the local mock server
+    make server          the local math-speak server into build/mathbot_server
+    make check           gcc -fanalyzer over src/ and server/
+    make test            unit tests plus end-to-end tests against the mock and the real server
     make dist            flat Gradescope bundle in dist/, proven to build three ways
+    make autograde       what Gradescope did: dist/client.c with plain gcc against the local server
     make clean           removes build/ and dist/
 
-    ./build/client netid@umass.edu 27993 128.119.243.147
+The course server (128.119.243.147:27993) and the Gradescope autograder no
+longer exist. server/mathbot_server.c replaces both locally (docs/server.md):
+it speaks the spec's protocol, forks a process per connection, sends 300..2000
+problems and ends with a 64-hex SHA-256 flag derived from the identification.
 
-    MATHBOT_VERBOSE=1 ./build/client ...    echoes every line sent (>>) and received (<<) on stderr
+    make server && make server-run          # terminal 1: serves on 27993 until Ctrl-C
+    ./build/client netid@umass.edu 27993 127.0.0.1    # terminal 2: prints the flag
 
-The real course server (128.119.243.147:27993) was not reachable from the
-machine this was developed on, so verification ran against the protocol mock
-in test/e2e/mock_server.py, which splits and coalesces messages on purpose and
-drops the connection on a wrong answer, as the spec describes, and checks the
-HELLO line byte for byte. Running the command above with a real NetID is the
-remaining step.
+    make server-run PORT=5000               # another port
+    MATHBOT_SECRET=changeme make server-run # flags no longer equal sha256(id)
+    MATHBOT_VERBOSE=1 ./build/client ...    # echoes every line sent (>>) and received (<<) on stderr
+
+    make autograde                          # PASS/FAIL like the autograder, exit status to match
+    make autograde AUTOGRADE_ID=netid@umass.edu
+
+The server can also run in Docker (server/Dockerfile, server/compose.yaml):
+    docker build -f server/Dockerfile -t mathbot-server . && docker run --rm -p 27993:27993 mathbot-server
 
 Requirements map
 ----------------
@@ -83,7 +92,10 @@ Design notes
   exercises every function (223 checks); test/e2e/*.sh drive the binary against
   test/e2e/mock_server.py (python3 standard library) for the happy path,
   fragmented, pipelined and CRLF-terminated messages, wrong-answer disconnect,
-  garbage line, division by zero, bad arguments and connection refused.
+  garbage line, division by zero, bad arguments and connection refused, and
+  against the real server (test/e2e/real_server.sh: one session, two at once,
+  a rejected HELLO, clean SIGTERM). test/unit/test_mathbot_server.c covers the
+  server the same way, SHA-256 against the FIPS vectors included.
 - Leniencies on input: a trailing '\r' is stripped, a '+'-prefixed operand is
   accepted, a BYE line without a final newline before the server closes still
   yields the flag, and the @umass.edu domain is matched case-insensitively.

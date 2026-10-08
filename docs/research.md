@@ -364,3 +364,109 @@ POSIX.1-2008 or ISO C99, so nothing depends on a recent toolchain.
   tolerates a client that fragments.
 - Tests whose correctness depends on wall-clock timing; timing only makes
   the fragmentation likely, correctness is asserted by the unit test.
+
+## 8. SHA-256 for the flag (server)
+
+### Sources
+
+- FIPS PUB 180-4, Secure Hash Standard, sections 4.1.2 (functions), 4.2.2
+  (constants), 5.1.1 (padding), 5.3.3 (initial hash value), 6.2 (SHA-256):
+  https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf
+- NIST CAVP example vectors for SHA-256 (`abc`, the two-block message):
+  https://csrc.nist.gov/projects/cryptographic-standards-and-guidelines/example-values
+- Python `hashlib` (local cross-check of every non-standard vector):
+  https://docs.python.org/3/library/hashlib.html
+
+### What was learned
+
+- The message is padded with one `0x80` byte, zeros, and the 64-bit
+  big-endian bit length so the total is a multiple of 64 bytes; when fewer
+  than 8 bytes remain after the `0x80`, a whole extra block is needed
+  (lengths 56..63 mod 64). The 55-, 56- and 64-byte inputs sit exactly on
+  those seams.
+- Each block expands into a 64-word schedule; 64 rounds mix eight working
+  variables with `Ch`, `Maj`, two big and two small sigma functions and the
+  64 round constants (fractional parts of cube roots of the first 64 primes);
+  the result is added into the running state. Everything is 32-bit modular
+  arithmetic on `uint32_t`, so `-Wconversion` only needs casts at the
+  byte/word boundaries.
+- Standard results: `sha256("") = e3b0c442…b855`,
+  `sha256("abc") = ba7816bf…15ad`,
+  `sha256("abcdbcde…nopq") = 248d6a61…06c1`.
+
+### Practices adopted in this code
+
+- `Sha256 { state[8]; byte_length; block[64]; block_used; }` with
+  `sha256_init`, `sha256_update` (compress on every full block),
+  `sha256_final` (pad, length, final compress, big-endian output). The
+  constants are `static const` locals inside the two functions that use them,
+  keeping the file free of globals.
+- The flag is `hex(sha256(secret || id))`; `MATHBOT_SECRET` empty by default
+  so the test helpers' `sha256(id)` stays valid.
+- Unit tests check the three standard vectors, the 55/56/64-byte padding
+  seams and a 1000-byte input fed in uneven pieces, all against `hashlib`.
+
+### Pitfalls avoided
+
+- Forgetting the extra padding block when 56..63 bytes are pending (the
+  classic off-by-one that passes `abc` and fails on longer input).
+- Counting the length in bytes where the spec wants bits.
+- Rotations written on `int` (undefined for the sign bit) instead of `uint32_t`.
+
+## 9. A forking TCP server: fork, SIGCHLD, clean shutdown
+
+### Sources
+
+- Beej's Guide, "A Simple Stream Server" (fork per connection, `sigaction`
+  for SIGCHLD, `SO_REUSEADDR`):
+  https://beej.us/guide/bgnet/html/split/client-server-background.html
+- fork(2): https://man7.org/linux/man-pages/man2/fork.2.html
+- sigaction(2): https://man7.org/linux/man-pages/man2/sigaction.2.html
+- waitpid(2): https://man7.org/linux/man-pages/man2/wait.2.html
+- signal-safety(7): https://man7.org/linux/man-pages/man7/signal-safety.7.html
+- accept(2): https://man7.org/linux/man-pages/man2/accept.2.html
+- socket(7), `SO_RCVTIMEO`: https://man7.org/linux/man-pages/man7/socket.7.html
+
+### What was learned
+
+- After `fork` both processes hold the accepted socket and the listener; the
+  child closes the listener, the parent closes the accepted socket, or the
+  connection never reaches EOF for the client.
+- A child that exits stays a zombie until waited for. Beej's handler
+  `while (waitpid(-1, NULL, WNOHANG) > 0);` reaps every finished child in one
+  go; `waitpid` is async-signal-safe and `errno` must be saved and restored
+  in the handler because it is clobbered. `SA_NOCLDSTOP` keeps stopped
+  children from raising the signal; `SA_RESTART` on the SIGCHLD action keeps
+  `accept` from returning `EINTR` on every session end.
+- `SIGINT`/`SIGTERM` handlers must only set a `volatile sig_atomic_t`.
+  Without `SA_RESTART`, a blocking `accept` returns `EINTR` when they run, so
+  the loop can check the flag. There is still a window between the check and
+  the call in which a signal is missed; the classic cures are a self-pipe or
+  `pselect`. socket(7) documents `SO_RCVTIMEO` for calls that "perform socket
+  I/O", and Linux applies it to `accept` as well: verified locally on kernel
+  7.2 with a 10-line program (`accept` returned `EAGAIN` after 1 s). A
+  one-second timeout on the listener turns the window into a one-second delay.
+- `SO_REUSEADDR` lets `bind` succeed while the previous instance's
+  connections are in `TIME_WAIT` (Beej: "Address already in use").
+- `fork` duplicates stdio buffers; unflushed output would be written twice.
+  Flushing after every log line keeps the buffers empty at `fork`.
+
+### Practices adopted in this code
+
+- `install_handler` wraps `sigaction` (memset, `sigemptyset`, flags) and
+  checks both calls; `install_signal_handlers` for the parent,
+  `restore_default_signals` in the child.
+- Parent: `accept` loop polling `shutdown_requested`, `EAGAIN`/`EINTR`/
+  `ECONNABORTED` are transient, anything else is fatal and exits 1.
+- Child: close listener, restore signals, set the 30 s `SO_RCVTIMEO`, serve,
+  close, `exit(EXIT_SUCCESS)`.
+- The server binds `0.0.0.0` so a published container port reaches it.
+
+### Pitfalls avoided
+
+- Calling `printf` or `malloc` in a signal handler.
+- Reaping with `wait()` (blocks) or reaping one child per signal (signals
+  coalesce, zombies accumulate).
+- Keeping the listener open in the child, which would keep the port busy
+  after the parent exits.
+- Letting a stalled client hold a child forever: `SO_RCVTIMEO` on every session.

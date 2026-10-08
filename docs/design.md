@@ -217,6 +217,21 @@ builds.
   reject; exit non-zero, nothing on stdout, message on stderr), garbage line
   (protocol error), division by zero (refused), bad arguments (each argument
   wrong in turn), and connection refused (a closed port).
+- `test/e2e/real_server.sh` runs the client against `server/mathbot_server.c`,
+  the local replacement for the course server (`docs/server.md`): one session
+  with `MATHBOT_PROBLEMS=400`, two sessions at once (fork per connection), a
+  wrong HELLO that gets no bytes back, and `SIGTERM` ending the server with
+  status 0. `lib.sh`'s `assert_flag_captured` confirms the flag with whichever
+  server is running: the mock's exit status, or a `flag sent` line in the real
+  server's log. The mock stays the fault-injection tool; the real server
+  proves the plain protocol path with a second, independent implementation.
+- `test/unit/test_mathbot_server.c` applies the include trick to the server:
+  SHA-256 standard vectors, flag derivation, generator ranges, truncating
+  division, HELLO and answer checks, configuration, line framing and the recv
+  timeout over a `socketpair`.
+- `make autograde` reproduces the Gradescope pipeline: `dist/client.c`
+  compiled with a plain `gcc client.c -o a.out`, run against the local server,
+  stdout compared with the flag Python's `hashlib` computes.
 
 ## 9. Deviations from the conventions
 
