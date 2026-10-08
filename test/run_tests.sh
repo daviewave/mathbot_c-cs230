@@ -31,8 +31,14 @@ for source in "$ROOT"/test/unit/test_*.c; do
     [ -e "$source" ] || continue
     name=$(basename "$source" .c)
     # shellcheck disable=SC2086
-    $CC $CFLAGS "$source" -o "$BUILD/test/$name"
-    run_test "$name" "$BUILD/test/$name"
+    if $CC $CFLAGS "$source" -o "$BUILD/test/$name" > "$BUILD/test/$name.compile.log" 2>&1; then
+        run_test "$name" "$BUILD/test/$name"
+    else
+        total=$((total + 1))
+        failures=$((failures + 1))
+        echo "FAIL $name (does not compile)"
+        sed 's/^/    /' "$BUILD/test/$name.compile.log"
+    fi
 done
 
 for script in "$ROOT"/test/e2e/*.sh; do

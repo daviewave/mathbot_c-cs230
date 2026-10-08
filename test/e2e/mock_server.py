@@ -62,16 +62,19 @@ class LineReader:
 class Sender:
     """Sends outgoing messages, fragmenting every FRAGMENT_EVERY-th one when asked to."""
 
-    def __init__(self, connection, fragment, rng):
-        """Remembers the connection, the fragmentation switch and the rng for split points."""
+    def __init__(self, connection, fragment, rng, crlf=False):
+        """Remembers the connection, the fragmentation switch, the rng for split points and the line ending."""
         self.connection = connection
         self.fragment = fragment
         self.rng = rng
+        self.crlf = crlf
         self.sent_messages = 0
 
     def send(self, data, force_fragment=False):
         """Sends one message, split in two writes when this is a fragmenting turn."""
         self.sent_messages += 1
+        if self.crlf:
+            data = data.replace(b"\n", b"\r\n")
         fragment_turn = self.fragment and self.sent_messages % FRAGMENT_EVERY == 0
         try:
             if (fragment_turn or force_fragment) and len(data) > 1:
@@ -99,6 +102,9 @@ def parse_arguments(argv):
     parser.add_argument("--pipeline", action="store_true", help="send every 5th problem together with the next")
     parser.add_argument("--reject", action="store_true", help="close after the first answer without BYE")
     parser.add_argument("--inject", default=None, metavar="LINE", help="send LINE instead of the first problem")
+    parser.add_argument("--identification", default=None, metavar="ID",
+                        help="require the HELLO line to carry exactly this identification")
+    parser.add_argument("--crlf", action="store_true", help="terminate every server line with CRLF")
     return parser.parse_args(argv)
 
 
@@ -139,7 +145,7 @@ def accept_one(listener):
     return connection
 
 
-def expect_hello(reader):
+def expect_hello(reader, required_identification):
     """Requires the first line to be exactly 'cs230 HELLO <id>' and returns the identification."""
     line = reader.read_line()
     if line is None:
@@ -149,6 +155,8 @@ def expect_hello(reader):
     identification = line[len(HELLO_PREFIX):]
     if not identification or identification != identification.strip() or " " in identification:
         raise ProtocolFailure("malformed identification %r" % identification)
+    if required_identification is not None and identification != required_identification:
+        raise ProtocolFailure("HELLO carried %r, expected %r" % (identification, required_identification))
     return identification
 
 
@@ -242,8 +250,8 @@ def send_bye(sender, identification, fragment):
 def serve(connection, options):
     """Runs one math-speak session; returns normally only when the session reached its planned end."""
     reader = LineReader(connection)
-    sender = Sender(connection, options.fragment, random.Random(options.seed ^ 0x5EED))
-    identification = expect_hello(reader)
+    sender = Sender(connection, options.fragment, random.Random(options.seed ^ 0x5EED), options.crlf)
+    identification = expect_hello(reader, options.identification)
     if options.inject is not None:
         serve_injected_line(sender, reader, options.inject)
         return

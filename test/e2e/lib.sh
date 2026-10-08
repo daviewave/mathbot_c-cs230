@@ -36,11 +36,12 @@ fail() {
     exit 1
 }
 
-# start_mock <mock args...>: launches the mock in the background and exports MOCK_PORT.
+# start_mock <mock args...>: launches the mock (requiring HELLO to carry $IDENTIFICATION) in the
+# background and exports MOCK_PORT.
 start_mock() {
     local portfile="$E2E_SCRATCH/port"
     rm -f "$portfile"
-    python3 -I "$MOCK_SERVER" --port-file "$portfile" "$@" 2> "$MOCK_ERR" &
+    python3 -I "$MOCK_SERVER" --port-file "$portfile" --identification "$IDENTIFICATION" "$@" 2> "$MOCK_ERR" &
     MOCK_PID=$!
     local tries=0
     while [ ! -s "$portfile" ]; do

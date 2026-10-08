@@ -17,6 +17,12 @@ main() {
     check_rejected_with_usage jdoe@umass.edu 0 127.0.0.1
     check_rejected_with_usage jdoe@umass.edu 70000 127.0.0.1
     check_rejected_with_usage jdoe@umass.edu 27993 localhost
+    check_rejected_with_usage jdoe@umass.edu 27993 127.0.0.1 extra
+    check_rejected_with_usage "j doe@umass.edu" 27993 127.0.0.1
+    check_rejected_with_usage a@b@umass.edu 27993 127.0.0.1
+    check_rejected_with_usage jdoe@umass.edu 27993x 127.0.0.1
+    check_rejected_with_usage jdoe@umass.edu +27993 127.0.0.1
+    check_rejected_with_usage jdoe@umass.edu 27993 ::1
 }
 
 main "$@"
