@@ -32,7 +32,7 @@ connection early (which is what it does on a wrong answer), is `EXIT_FAILURE`.
 typedef struct {
     const char *identification;
     unsigned short port;
-    const char *host;
+    struct in_addr host;      /* parsed once by inet_pton, reused by connect */
 } ClientArguments;
 
 typedef struct {
@@ -42,7 +42,7 @@ typedef struct {
 
 typedef struct {
     long long left;
-    char operator;
+    char operation;
     long long right;
 } MathProblem;
 ```
@@ -50,8 +50,9 @@ typedef struct {
 `LineBuffer` is the whole answer to TCP framing. `recv` returns whatever bytes
 the kernel has, which may be half a line or two lines at once. The buffer
 accumulates bytes; `line_buffer_take_line` copies the first complete
-`\n`-terminated line out (without the `\n`) and shifts the remainder to the
-front with `memmove`. The network reader loops `take_line → recv → append`
+`\n`-terminated line out (without the `\n`, and without one trailing `\r` so a
+CRLF server parses like an LF one) and shifts the remainder to the front with
+`memmove`. The network reader loops `take_line → recv → append`
 until a line is available. Because the extraction is separate from `recv`,
 it is unit-tested with hand-fed fragments, and the socket reader is
 unit-tested over an `AF_UNIX` `socketpair`.
@@ -69,8 +70,10 @@ Messages are classified by two parsers that both return `bool`:
   `cs230 STATUS <num> <op> <num>` with single spaces, `<op>` one of `+ - * /`,
   operands parsed by `strtoll` with `endptr` and `errno == ERANGE` checks.
   Leading whitespace before an operand is rejected explicitly because
-  `strtoll` would otherwise skip it; trailing text after the second operand is
-  rejected. The spec says protocols are exact, so the parser is exact too.
+  `strtoll` would otherwise skip it; an explicit `+` or `-` sign is accepted
+  because `strtoll` accepts it and nothing is gained by refusing `+5`; trailing
+  text after the second operand is rejected. The spec says protocols are
+  exact, so the parser is exact everywhere a leniency could change an answer.
 - `parse_bye(line, flag, capacity)` accepts `cs230 <flag> BYE` where the
   flag is a non-empty token with no spaces. The flag is not required to be 64
   characters: the spec's example is 64 hex characters, but the autograder runs
@@ -78,7 +81,14 @@ Messages are classified by two parsers that both return `bool`:
 
 Any line that is neither is a protocol error: it is printed to `stderr` and
 the client exits `EXIT_FAILURE`. The first message after HELLO is a STATUS per
-the spec, so no special case is needed for it.
+the spec, so no special case is needed for it. Skipping unknown lines instead
+was considered and rejected: a client that silently ignores what it does not
+understand hides exactly the bugs this protocol's exactness is meant to expose.
+
+Operands or results outside `long long` are also protocol errors. The server
+could in principle send bigger numbers, but the spec gives no range, the
+example operands are three digits, and answering with a wrong number is worse
+than refusing.
 
 ### Arithmetic
 
@@ -91,8 +101,8 @@ pre-checks from CERT INT32-C (adapted to `long long`); the server's operands
 are small in practice, but the guard costs nothing and keeps `-fanalyzer`
 and a reviewer happy.
 
-The answer is formatted with `snprintf("%s %lld\n", "cs230", answer)` into a
-fixed buffer and sent with `send_all`, which loops until every byte is
+The answer is formatted with `snprintf("%s%lld\n", PROTOCOL_PREFIX, answer)`
+(the prefix carries its own trailing space) into a fixed buffer and sent with `send_all`, which loops until every byte is
 written because `send` on a stream socket may write fewer bytes than asked.
 
 ### Session loop
@@ -108,7 +118,13 @@ loop:
 
 `receive_line` distinguishes three outcomes (`RECEIVE_LINE`, `RECEIVE_EOF`,
 `RECEIVE_ERROR`). EOF before BYE is the server's way of saying the last
-answer was wrong, so the message says so.
+answer was wrong, so the message says so. One exception: if the bytes left in
+the buffer at EOF form a BYE line that merely lacked its final newline, the
+flag is on the wire and is printed; a buffered STATUS fragment at EOF is not
+answered, because nobody is listening.
+
+No receive timeout is set: the spec itself says a slow run "may not be wrong",
+and a stalled server is visible with `MATHBOT_VERBOSE=1`.
 
 ## 4. Sockets
 
@@ -153,21 +169,33 @@ builds.
 | Function | Responsibility |
 | --- | --- |
 | `print_usage` | usage line on stderr |
-| `is_valid_identification` | NetID@umass.edu check |
+| `contains_whitespace`, `equals_ignoring_case` | string helpers for validation |
+| `is_valid_identification` | NetID@umass.edu check (domain case-insensitive, no whitespace, one `@`) |
 | `parse_port` | string → 1..65535 |
-| `parse_arguments` | argc/argv → `ClientArguments` |
+| `parse_host` | dotted quad → `struct in_addr` via `inet_pton` |
+| `parse_arguments` | argc/argv → `ClientArguments`, reason on stderr |
 | `line_buffer_append` | add received bytes, false on overflow |
+| `copy_line_out`, `line_buffer_drop` | copy a line out (dropping `\r`), shift the rest down |
 | `line_buffer_take_line` | extract one complete line |
-| `receive_line` | `recv` loop feeding the buffer |
-| `send_all` | `send` loop |
-| `send_line` | format + send, with verbose echo |
-| `parse_operand` | strict `strtoll` wrapper |
+| `line_buffer_take_remainder` | the unterminated tail after EOF |
+| `receive_line` | `recv` loop feeding the buffer; EINTR retried |
+| `send_all` | `send` loop over short writes |
+| `send_line` | send one line, with verbose echo |
+| `send_hello` | format and send the HELLO line |
+| `close_socket` | `close` with the failure reported |
+| `connect_to_server` | socket + sockaddr_in + connect, socket closed on failure |
+| `parse_operand`, `is_operator`, `parse_operator` | strict tokenising of a STATUS line |
 | `parse_status` | STATUS line → `MathProblem` |
 | `parse_bye` | BYE line → flag |
-| `evaluate` | checked arithmetic |
-| `connect_to_server` | socket + sockaddr_in + connect |
+| `add_checked`, `subtract_checked`, `multiplication_fits`, `multiply_checked`, `divide_checked` | overflow-guarded arithmetic |
+| `evaluate` | dispatch on the operator |
+| `report_early_disconnect` | the EOF-before-BYE message |
 | `handle_status` | evaluate and answer one problem |
+| `print_flag` | flag on stdout, `printf` and `fflush` checked |
+| `handle_line` | STATUS → answer, BYE → flag, else protocol error |
+| `handle_eof` | accept a BYE tail at EOF, otherwise early disconnect |
 | `run_session` | HELLO then the receive/answer loop |
+| `is_verbose_enabled` | `MATHBOT_VERBOSE` |
 | `main` | signal, arguments, connect, session, close |
 
 ## 8. Testing strategy
@@ -192,7 +220,19 @@ builds.
 
 ## 9. Deviations from the conventions
 
-None. The spec says no README or Makefile needs to be submitted; both are
-produced anyway because the conventions ask for them and they cost nothing.
-`make dist` runs `make -C dist`, which the conventions themselves prescribe as
-the proof that the bundle builds; it is the one place a nested make appears.
+- The Makefile says `CC = gcc`, not `CC ?= gcc`: GNU make predefines `CC` as
+  `cc`, so `?=` would never take effect and the gate would print `cc`. A
+  command-line `make CC=clang` still overrides it, which is what the rule wants.
+- `test/e2e/cases/` is empty and therefore absent from git: the client reads
+  nothing from stdin, so there are no stdin scripts; the e2e scripts assert on
+  the binary's stdout, stderr and exit status against the mock server instead.
+- Diagnostics written with `fprintf(stderr, …)` are not return-checked. There
+  is nothing to do when stderr is broken; the system calls and the stdout
+  `printf`/`fflush` that carry the flag are all checked.
+- `close` failing after a completed session is reported but does not change
+  the exit status: the flag was captured, which is the rubric item.
+
+The spec says no README or Makefile needs to be submitted; both are produced
+anyway because the conventions ask for them and they cost nothing. `make dist`
+runs `make -C dist`, which the conventions themselves prescribe as the proof
+that the bundle builds; it is the one place a nested make appears.

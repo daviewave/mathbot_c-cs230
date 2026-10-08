@@ -1,6 +1,6 @@
 # Math Bot Client Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> Implemented task by task in order; steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A single-file C99 TCP client (`src/client.c`) that identifies to the CS230 math server, answers every `STATUS` problem exactly, prints the flag from the `BYE` message, and is proven by unit tests and an end-to-end suite against a local mock server.
 
@@ -20,7 +20,7 @@
 - On `cs230 <FLAG> BYE\n`: print the flag on stdout, exit `EXIT_SUCCESS`. Any other outcome: message on stderr, `EXIT_FAILURE`.
 - Every system call return value is checked. Every function has a header comment; no narration inside bodies.
 - `make clean && make && make check && make test && make dist` must pass.
-- No `Co-Authored-By`, no mention of AI assistance anywhere. Never push.
+- No `Co-Authored-By` trailers. Never push.
 
 ## Review Focus
 

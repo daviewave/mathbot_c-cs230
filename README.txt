@@ -32,9 +32,9 @@ Build and run
 The real course server (128.119.243.147:27993) was not reachable from the
 machine this was developed on, so verification ran against the protocol mock
 in test/e2e/mock_server.py, which splits and coalesces messages on purpose and
-drops the connection on a wrong answer, exactly as the spec describes. Running
-the command above with a real NetID is the remaining step; the mock and the
-spec agree on every byte of the protocol.
+drops the connection on a wrong answer, as the spec describes, and checks the
+HELLO line byte for byte. Running the command above with a real NetID is the
+remaining step.
 
 Requirements map
 ----------------
@@ -55,8 +55,9 @@ Step 6: repeat 300..2000 times                      run_session loop; e2e happy_
 Step 7: receive "cs230 <FLAG> BYE\n", capture flag  parse_bye, print_flag (flag alone on stdout, exit 0)
 Division truncated (200 / 3 -> 66)                  divide_checked (C99 6.5.5), test_evaluate_division_truncates_toward_zero
 No extra bytes in messages                          send_line sends exactly the formatted line; verified by unit tests
-Check system-call return values                     socket, connect, send, recv, close, signal, printf/fflush all checked;
-                                                    recv/send retry EINTR; send loops over short writes (send_all)
+Check system-call return values                     socket, connect, send, recv, close, signal, inet_pton, snprintf and the
+                                                    stdout printf/fflush are checked; recv/send retry EINTR; send loops
+                                                    over short writes (send_all); stderr diagnostics are fire-and-forget
 Server drops connection on a wrong answer           receive_line returns RECEIVE_EOF -> report_early_disconnect, exit 1
 Messages split across / coalesced within recv()     LineBuffer, line_buffer_append, line_buffer_take_line;
                                                     unit tests test_take_line_*, test_receive_line_*; e2e fragmented, pipelined
@@ -81,8 +82,13 @@ Design notes
 - Tests: test/unit/test_client.c includes client.c with main renamed and
   exercises every function (223 checks); test/e2e/*.sh drive the binary against
   test/e2e/mock_server.py (python3 standard library) for the happy path,
-  fragmented and pipelined messages, wrong-answer disconnect, garbage line,
-  division by zero, bad arguments and connection refused.
+  fragmented, pipelined and CRLF-terminated messages, wrong-answer disconnect,
+  garbage line, division by zero, bad arguments and connection refused.
+- Leniencies on input: a trailing '\r' is stripped, a '+'-prefixed operand is
+  accepted, a BYE line without a final newline before the server closes still
+  yields the flag, and the @umass.edu domain is matched case-insensitively.
+  Everything else is byte-exact: extra spaces, unknown lines and operands
+  outside long long are protocol errors (see docs/design.md).
 - Rationale for every decision: docs/design.md; sources: docs/research.md.
 
 Video: not required for this project (spec: "There is no video for this last submission").
