@@ -1,0 +1,20 @@
+# Compose definition for the local math-speak server (docs/server.md).
+#   docker compose -f server/compose.yaml up --build
+# Paths are relative to this file, so `..` is the repository root; the root .dockerignore keeps
+# the build context down to server/.
+services:
+  mathbot-server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    image: mathbot-server
+    # Host 27993 -> container 27993, the course server's port, so the client command stays
+    #   ./build/client you@umass.edu 27993 127.0.0.1
+    ports:
+      - "27993:27993"
+    # Keep serving across daemon restarts until explicitly stopped.
+    restart: unless-stopped
+    environment:
+      # Prepended to the identification before hashing; empty (the default) reproduces the
+      # flags the test suite expects, anything else makes the flags unguessable.
+      MATHBOT_SECRET: ${MATHBOT_SECRET:-}

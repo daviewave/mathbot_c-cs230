@@ -1,0 +1,3 @@
+# The image only needs server/mathbot_server.c; everything else stays out of the build context.
+*
+!server/
