@@ -614,6 +614,16 @@ static void test_connect_refused(void) {
 
 ---
 
+### Execution note
+
+Tasks 3, 4 and 5 were executed as two commits instead of three: under
+`-Werror=unused-function` a commit containing only the `LineBuffer` helpers does
+not compile, so Task 3 shipped together with the socket plumbing of Task 5
+(`receive_line`, `send_all`, `send_hello`, `connect_to_server`, `run_session`,
+`main`) and their `socketpair` tests, and Task 4 shipped with `handle_status`,
+`print_flag` and `handle_line` wired into `run_session`. Every test listed above
+exists in `test/unit/test_client.c`.
+
 ### Task 7: README, gate, review
 
 - [ ] **Step 1:** Fill `README.txt`: overview, build/run, requirements map (every spec bullet → function), design notes, the sandbox note (real server unreachable; verified against the mock), no-video line.
