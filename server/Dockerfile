@@ -17,10 +17,12 @@ RUN apt-get update \
 WORKDIR /build
 COPY server/mathbot_server.c .
 
-# Same flags as CFLAGS in the Makefile (docs/conventions.md section 2), minus the dependency output.
+# Same warnings as CFLAGS in the Makefile (docs/conventions.md section 2) without -Werror: the
+# repository gate enforces zero warnings with the development compiler, and bookworm's gcc 12 must
+# not fail the image build over a diagnostic that differs between compiler versions.
 RUN gcc -O2 -std=c99 -D_POSIX_C_SOURCE=200809L \
         -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
-        -Wconversion -Wvla -Werror \
+        -Wconversion -Wvla \
         mathbot_server.c -o mathbot_server
 
 FROM debian:bookworm-slim
