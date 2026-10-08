@@ -1,0 +1,10 @@
+build/
+dist/
+*.o
+*.d
+core
+core.*
+*.swp
+*~
+.vscode/
+.idea/
