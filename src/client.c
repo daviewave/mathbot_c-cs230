@@ -33,10 +33,11 @@ enum {
 #define BYE_SUFFIX " BYE"
 #define VERBOSE_VARIABLE "MATHBOT_VERBOSE"
 
+/* The validated command line: identification as given, port and host ready for sockaddr_in. */
 typedef struct {
     const char *identification;
     unsigned short port;
-    const char *host;
+    struct in_addr host;
 } ClientArguments;
 
 /* Bytes received from the server that have not been consumed as whole lines yet. */
@@ -52,12 +53,14 @@ typedef struct {
     long long right;
 } MathProblem;
 
+/* Outcome of waiting for one line: a line, the peer closed, or a failure already reported. */
 typedef enum {
     RECEIVE_LINE,
     RECEIVE_EOF,
     RECEIVE_ERROR
 } ReceiveResult;
 
+/* What the session loop does after one server line. */
 typedef enum {
     SESSION_CONTINUE,
     SESSION_DONE,
@@ -79,7 +82,17 @@ static bool contains_whitespace(const char *text) {
     return false;
 }
 
-/* True for a non-empty NetID followed by @umass.edu, with no whitespace or second '@'. */
+/* True when left and right are equal ignoring ASCII case. */
+static bool equals_ignoring_case(const char *left, const char *right) {
+    for (; *left != '\0' && *right != '\0'; left++, right++) {
+        if (tolower((unsigned char)*left) != tolower((unsigned char)*right)) {
+            return false;
+        }
+    }
+    return *left == *right;
+}
+
+/* True for a non-empty NetID followed by @umass.edu (any case), with no whitespace or second '@'. */
 static bool is_valid_identification(const char *identification) {
     size_t length = strlen(identification);
     size_t domain_length = strlen(IDENTIFICATION_DOMAIN);
@@ -88,7 +101,7 @@ static bool is_valid_identification(const char *identification) {
         return false;
     }
     domain_start = identification + length - domain_length;
-    if (strcmp(domain_start, IDENTIFICATION_DOMAIN) != 0 || strchr(identification, '@') != domain_start) {
+    if (!equals_ignoring_case(domain_start, IDENTIFICATION_DOMAIN) || strchr(identification, '@') != domain_start) {
         return false;
     }
     return !contains_whitespace(identification);
@@ -110,16 +123,15 @@ static bool parse_port(const char *text, unsigned short *port) {
     return true;
 }
 
-/* True when host is a dotted-quad IPv4 address. */
-static bool is_valid_host(const char *host) {
-    struct in_addr address;
-    return inet_pton(AF_INET, host, &address) == 1;
+/* Parses a dotted-quad IPv4 address into network byte order. */
+static bool parse_host(const char *text, struct in_addr *host) {
+    return inet_pton(AF_INET, text, host) == 1;
 }
 
 /* Validates argv into arguments; on failure prints the reason on stderr and returns false. */
 static bool parse_arguments(int argc, char **argv, ClientArguments *arguments) {
     if (argc != EXPECTED_ARGUMENT_COUNT) {
-        fprintf(stderr, "expected 3 arguments, got %d\n", argc - 1);
+        fprintf(stderr, "expected %d arguments, got %d\n", EXPECTED_ARGUMENT_COUNT - 1, argc - 1);
         return false;
     }
     if (!is_valid_identification(argv[1])) {
@@ -130,12 +142,11 @@ static bool parse_arguments(int argc, char **argv, ClientArguments *arguments) {
         fprintf(stderr, "invalid port '%s': expected 1..65535\n", argv[2]);
         return false;
     }
-    if (!is_valid_host(argv[3])) {
+    if (!parse_host(argv[3], &arguments->host)) {
         fprintf(stderr, "invalid host '%s': expected an IPv4 address\n", argv[3]);
         return false;
     }
     arguments->identification = argv[1];
-    arguments->host = argv[3];
     return true;
 }
 
@@ -149,24 +160,49 @@ static bool line_buffer_append(LineBuffer *buffer, const char *bytes, size_t cou
     return true;
 }
 
-/* Copies the first complete line (without its newline) into line and removes it
- * from the buffer; false when no complete line is buffered or it exceeds capacity. */
-static bool line_buffer_take_line(LineBuffer *buffer, char *line, size_t capacity) {
-    const char *newline = memchr(buffer->data, '\n', buffer->used);
-    size_t length;
-    size_t consumed;
-    if (newline == NULL) {
-        return false;
+/* Copies the first length bytes of the buffer into line as a string, dropping one
+ * trailing carriage return so CRLF servers parse like LF ones; false when it does not fit. */
+static bool copy_line_out(const LineBuffer *buffer, size_t length, char *line, size_t capacity) {
+    if (length > 0 && buffer->data[length - 1] == '\r') {
+        length--;
     }
-    length = (size_t)(newline - buffer->data);
     if (length >= capacity) {
         return false;
     }
     memcpy(line, buffer->data, length);
     line[length] = '\0';
-    consumed = length + 1;
-    buffer->used -= consumed;
-    memmove(buffer->data, buffer->data + consumed, buffer->used);
+    return true;
+}
+
+/* Removes the first count bytes from the buffer. */
+static void line_buffer_drop(LineBuffer *buffer, size_t count) {
+    buffer->used -= count;
+    memmove(buffer->data, buffer->data + count, buffer->used);
+}
+
+/* Copies the first complete line (without its newline) into line and removes it
+ * from the buffer; false when no complete line is buffered or it exceeds capacity. */
+static bool line_buffer_take_line(LineBuffer *buffer, char *line, size_t capacity) {
+    const char *newline = memchr(buffer->data, '\n', buffer->used);
+    size_t length;
+    if (newline == NULL) {
+        return false;
+    }
+    length = (size_t)(newline - buffer->data);
+    if (!copy_line_out(buffer, length, line, capacity)) {
+        return false;
+    }
+    line_buffer_drop(buffer, length + 1);
+    return true;
+}
+
+/* Copies whatever is buffered after the peer closed, for a final line that lacked
+ * its newline; false when the buffer is empty or the remainder does not fit. */
+static bool line_buffer_take_remainder(LineBuffer *buffer, char *line, size_t capacity) {
+    if (buffer->used == 0 || !copy_line_out(buffer, buffer->used, line, capacity)) {
+        return false;
+    }
+    line_buffer_drop(buffer, buffer->used);
     return true;
 }
 
@@ -239,8 +275,9 @@ static bool close_socket(int socket_fd) {
 }
 
 /* Opens a TCP connection to host:port; returns the descriptor or -1. */
-static int connect_to_server(const char *host, unsigned short port) {
+static int connect_to_server(const struct in_addr *host, unsigned short port) {
     struct sockaddr_in address;
+    char host_text[INET_ADDRSTRLEN] = "?";
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd < 0) {
         fprintf(stderr, "socket: %s\n", strerror(errno));
@@ -249,24 +286,21 @@ static int connect_to_server(const char *host, unsigned short port) {
     memset(&address, 0, sizeof address);
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &address.sin_addr) != 1) {
-        fprintf(stderr, "invalid host '%s'\n", host);
-        (void)close_socket(socket_fd);
-        return -1;
-    }
+    address.sin_addr = *host;
     if (connect(socket_fd, (struct sockaddr *)&address, sizeof address) != 0) {
-        fprintf(stderr, "connect to %s:%u: %s\n", host, (unsigned int)port, strerror(errno));
+        (void)inet_ntop(AF_INET, host, host_text, sizeof host_text);
+        fprintf(stderr, "connect to %s:%u: %s\n", host_text, (unsigned int)port, strerror(errno));
         (void)close_socket(socket_fd);
         return -1;
     }
     return socket_fd;
 }
 
-/* Parses a long long starting exactly at text (no leading whitespace or '+',
- * which strtoll would accept); end receives the first unparsed character. */
+/* Parses a long long starting exactly at text (strtoll would skip leading
+ * whitespace, which the protocol never has); end receives the first unparsed character. */
 static bool parse_operand(const char *text, const char **end, long long *value) {
     char *parse_end;
-    if (text[0] != '-' && !isdigit((unsigned char)text[0])) {
+    if (text[0] != '-' && text[0] != '+' && !isdigit((unsigned char)text[0])) {
         return false;
     }
     errno = 0;
@@ -283,6 +317,16 @@ static bool is_operator(char candidate) {
     return candidate == '+' || candidate == '-' || candidate == '*' || candidate == '/';
 }
 
+/* Parses " <op> " (one operator between single spaces) at text; end moves past it. */
+static bool parse_operator(const char *text, const char **end, char *operation) {
+    if (text[0] != ' ' || !is_operator(text[1]) || text[2] != ' ') {
+        return false;
+    }
+    *operation = text[1];
+    *end = text + 3;
+    return true;
+}
+
 /* Parses "cs230 STATUS <num> <op> <num>" with single spaces and nothing else. */
 static bool parse_status(const char *line, MathProblem *problem) {
     const char *cursor;
@@ -293,11 +337,9 @@ static bool parse_status(const char *line, MathProblem *problem) {
     if (!parse_operand(cursor, &cursor, &problem->left)) {
         return false;
     }
-    if (cursor[0] != ' ' || !is_operator(cursor[1]) || cursor[2] != ' ') {
+    if (!parse_operator(cursor, &cursor, &problem->operation)) {
         return false;
     }
-    problem->operation = cursor[1];
-    cursor += 3;
     if (!parse_operand(cursor, &cursor, &problem->right)) {
         return false;
     }
@@ -436,6 +478,22 @@ static SessionOutcome handle_line(int socket_fd, const char *line, bool verbose)
     return SESSION_FAILED;
 }
 
+/* After the peer closed: a buffered BYE line that lacked its newline still counts;
+ * anything else (nothing, or a problem nobody is left to answer) is an early disconnect. */
+static SessionOutcome handle_eof(LineBuffer *buffer, char *line, size_t capacity, bool verbose) {
+    char flag[FLAG_CAPACITY];
+    if (line_buffer_take_remainder(buffer, line, capacity)) {
+        if (verbose) {
+            fprintf(stderr, "<< %s\n", line);
+        }
+        if (parse_bye(line, flag, sizeof flag)) {
+            return print_flag(flag) ? SESSION_DONE : SESSION_FAILED;
+        }
+    }
+    report_early_disconnect();
+    return SESSION_FAILED;
+}
+
 /* Identifies to the server and processes its lines until BYE; returns the exit status. */
 static int run_session(int socket_fd, const char *identification, bool verbose) {
     LineBuffer buffer = { {0}, 0 };
@@ -447,16 +505,15 @@ static int run_session(int socket_fd, const char *identification, bool verbose) 
     while (outcome == SESSION_CONTINUE) {
         ReceiveResult result = receive_line(socket_fd, &buffer, line, sizeof line);
         if (result == RECEIVE_EOF) {
-            report_early_disconnect();
-            return EXIT_FAILURE;
+            outcome = handle_eof(&buffer, line, sizeof line, verbose);
+        } else if (result == RECEIVE_ERROR) {
+            outcome = SESSION_FAILED;
+        } else {
+            if (verbose) {
+                fprintf(stderr, "<< %s\n", line);
+            }
+            outcome = handle_line(socket_fd, line, verbose);
         }
-        if (result == RECEIVE_ERROR) {
-            return EXIT_FAILURE;
-        }
-        if (verbose) {
-            fprintf(stderr, "<< %s\n", line);
-        }
-        outcome = handle_line(socket_fd, line, verbose);
     }
     return outcome == SESSION_DONE ? EXIT_SUCCESS : EXIT_FAILURE;
 }
@@ -467,7 +524,8 @@ static bool is_verbose_enabled(void) {
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
-/* Entry point: ignore SIGPIPE, validate arguments, connect, run the session, close. */
+/* Entry point: ignore SIGPIPE, validate arguments, connect, run the session, close.
+ * A close failure after the session is reported but does not change the outcome. */
 int main(int argc, char **argv) {
     const char *program = argc > 0 ? argv[0] : "client";
     ClientArguments arguments;
@@ -481,13 +539,11 @@ int main(int argc, char **argv) {
         print_usage(program);
         return EXIT_FAILURE;
     }
-    socket_fd = connect_to_server(arguments.host, arguments.port);
+    socket_fd = connect_to_server(&arguments.host, arguments.port);
     if (socket_fd < 0) {
         return EXIT_FAILURE;
     }
     status = run_session(socket_fd, arguments.identification, is_verbose_enabled());
-    if (!close_socket(socket_fd)) {
-        return EXIT_FAILURE;
-    }
+    (void)close_socket(socket_fd);
     return status;
 }

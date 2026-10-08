@@ -17,6 +17,8 @@ static void test_identification(void) {
     CHECK(!is_valid_identification("j doe@umass.edu"));
     CHECK(!is_valid_identification("a@b@umass.edu"));
     CHECK(!is_valid_identification(""));
+    CHECK(is_valid_identification("JDoe@UMass.EDU"));
+    CHECK(!is_valid_identification("jdoe@umass.edu.evil"));
 }
 
 static void test_parse_port(void) {
@@ -36,12 +38,15 @@ static void test_parse_port(void) {
 }
 
 static void test_host(void) {
-    CHECK(is_valid_host("128.119.243.147"));
-    CHECK(is_valid_host("127.0.0.1"));
-    CHECK(!is_valid_host("localhost"));
-    CHECK(!is_valid_host("256.1.1.1"));
-    CHECK(!is_valid_host("1.2.3"));
-    CHECK(!is_valid_host(""));
+    struct in_addr host;
+    CHECK(parse_host("128.119.243.147", &host));
+    CHECK_EQ_INT(ntohl(host.s_addr), 0x8077F393UL);
+    CHECK(parse_host("127.0.0.1", &host));
+    CHECK(!parse_host("localhost", &host));
+    CHECK(!parse_host("256.1.1.1", &host));
+    CHECK(!parse_host("1.2.3", &host));
+    CHECK(!parse_host("::1", &host));
+    CHECK(!parse_host("", &host));
 }
 
 static void test_parse_arguments(void) {
@@ -54,7 +59,7 @@ static void test_parse_arguments(void) {
     CHECK(parse_arguments(4, good, &arguments));
     CHECK_EQ_STR(arguments.identification, "jdoe@umass.edu");
     CHECK_EQ_INT(arguments.port, 27993);
-    CHECK_EQ_STR(arguments.host, "128.119.243.147");
+    CHECK_EQ_INT(ntohl(arguments.host.s_addr), 0x8077F393UL);
     CHECK(!parse_arguments(3, bad_count, &arguments));
     CHECK(!parse_arguments(4, bad_port, &arguments));
     CHECK(!parse_arguments(4, bad_host, &arguments));
@@ -87,6 +92,27 @@ static void test_take_line_coalesced(void) {
     CHECK(line_buffer_append(&buffer, "ATUS 3 - 4\n", 11));
     CHECK(line_buffer_take_line(&buffer, line, sizeof line));
     CHECK_EQ_STR(line, "cs230 STATUS 3 - 4");
+    CHECK_EQ_INT(buffer.used, 0);
+}
+
+static void test_take_line_strips_carriage_return(void) {
+    LineBuffer buffer = { {0}, 0 };
+    char line[RECEIVE_BUFFER_SIZE];
+    CHECK(line_buffer_append(&buffer, "cs230 STATUS 1 + 2\r\n\r\n", 22));
+    CHECK(line_buffer_take_line(&buffer, line, sizeof line));
+    CHECK_EQ_STR(line, "cs230 STATUS 1 + 2");
+    CHECK(line_buffer_take_line(&buffer, line, sizeof line));
+    CHECK_EQ_STR(line, "");
+    CHECK_EQ_INT(buffer.used, 0);
+}
+
+static void test_take_remainder(void) {
+    LineBuffer buffer = { {0}, 0 };
+    char line[RECEIVE_BUFFER_SIZE];
+    CHECK(!line_buffer_take_remainder(&buffer, line, sizeof line));
+    CHECK(line_buffer_append(&buffer, "cs230 abc BYE\r", 14));
+    CHECK(line_buffer_take_remainder(&buffer, line, sizeof line));
+    CHECK_EQ_STR(line, "cs230 abc BYE");
     CHECK_EQ_INT(buffer.used, 0);
 }
 
@@ -198,7 +224,9 @@ static void test_send_all_to_closed_peer_fails(void) {
 }
 
 static void test_connect_refused(void) {
-    CHECK(connect_to_server("127.0.0.1", 1) < 0);
+    struct in_addr loopback;
+    CHECK(parse_host("127.0.0.1", &loopback));
+    CHECK(connect_to_server(&loopback, 1) < 0);
 }
 
 static void test_verbose_flag(void) {
@@ -239,7 +267,10 @@ static void test_parse_status_rejects_malformed(void) {
     CHECK(!parse_status("cs230 STATUS 1 +", &problem));
     CHECK(!parse_status("cs230 STATUS 1 + ", &problem));
     CHECK(!parse_status("cs230 STATUS a + 2", &problem));
-    CHECK(!parse_status("cs230 STATUS +1 + 2", &problem));
+    CHECK(parse_status("cs230 STATUS +1 + +2", &problem));
+    CHECK_EQ_INT(problem.left, 1);
+    CHECK_EQ_INT(problem.right, 2);
+    CHECK(!parse_status("cs230 STATUS + + 2", &problem));
     CHECK(!parse_status("cs230 STATUS - + 2", &problem));
     CHECK(!parse_status("cs230 STATUS 1 + 2\r", &problem));
     CHECK(!parse_status("cs230 STATUS 99999999999999999999 + 2", &problem));
@@ -377,6 +408,19 @@ static void test_run_session_early_close_fails(void) {
     CHECK_EQ_STR(received, "cs230 HELLO jdoe@umass.edu\ncs230 2\n");
 }
 
+static void test_run_session_accepts_crlf_and_final_bye_without_newline(void) {
+    char received[256];
+    CHECK_EQ_INT(run_scripted_session("cs230 STATUS 200 / 3\r\ncs230 abc123 BYE\r\n",
+                                      received, sizeof received), EXIT_SUCCESS);
+    CHECK_EQ_STR(received, "cs230 HELLO jdoe@umass.edu\ncs230 66\n");
+    CHECK_EQ_INT(run_scripted_session("cs230 STATUS 1 + 1\ncs230 abc123 BYE", received, sizeof received),
+                 EXIT_SUCCESS);
+    CHECK_EQ_STR(received, "cs230 HELLO jdoe@umass.edu\ncs230 2\n");
+    CHECK_EQ_INT(run_scripted_session("cs230 STATUS 1 + 1\ncs230 STATUS 2 + 2", received, sizeof received),
+                 EXIT_FAILURE);
+    CHECK_EQ_STR(received, "cs230 HELLO jdoe@umass.edu\ncs230 2\n");
+}
+
 static void test_run_session_rejects_garbage(void) {
     char received[256];
     CHECK_EQ_INT(run_scripted_session("cs230 WHAT\ncs230 STATUS 1 + 1\n", received, sizeof received), EXIT_FAILURE);
@@ -392,6 +436,8 @@ int main(void) {
     test_parse_arguments();
     test_take_line_split_fragments();
     test_take_line_coalesced();
+    test_take_line_strips_carriage_return();
+    test_take_remainder();
     test_take_line_empty_line();
     test_take_line_rejects_line_over_capacity();
     test_append_overflow();
@@ -415,5 +461,6 @@ int main(void) {
     test_run_session_answers_then_prints_flag();
     test_run_session_early_close_fails();
     test_run_session_rejects_garbage();
+    test_run_session_accepts_crlf_and_final_bye_without_newline();
     CHECK_REPORT("test_client");
 }
